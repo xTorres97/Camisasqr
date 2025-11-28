@@ -2,105 +2,245 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Debug init</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
-  <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
+  <title>AR Camiseta - OpenCV Template Matching</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
   <style>
-    body, html { margin:0; padding:0; height:100%; overflow:hidden; background:#000; color:#fff; font-family:Arial, sans-serif; }
-    #startBtn { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); padding:12px 18px; font-size:16px; border-radius:8px; background:#ff4fa8; color:white; border:none; cursor:pointer; display:none; }
-    #note { position:fixed; bottom:10px; left:10px; right:10px; text-align:center; font-size:14px; opacity:0.9; }
-    #log { position:fixed; top:8px; left:8px; padding:8px; background:rgba(0,0,0,0.6); color:#fff; border-radius:6px; max-width:40%; font-size:12px; }
+    html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
+    #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
+    video#cam{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);} /* espejo para UX */
+    canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none}
+    #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:30}
+    #note{position:fixed;left:0;right:0;bottom:10px;text-align:center;z-index:30;opacity:0.9}
+    #log{position:fixed;left:8px;top:8px;background:rgba(0,0,0,0.5);padding:6px 8px;border-radius:6px;font-size:12px;z-index:30}
   </style>
 </head>
 <body>
-  <div id="log">Inicializando...</div>
+  <div id="videoWrapper">
+    <video id="cam" autoplay playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
   <button id="startBtn">Activar AR</button>
   <div id="note">Apunta la cámara hacia la imagen de la camiseta</div>
+  <div id="log">listo</div>
 
-  <!-- a-scene: dejamos mindar-image vacío inicialmente; lo rellenamos dinámicamente -->
-  <a-scene id="arScene"
-      embedded color-space="sRGB" vr-mode-ui="enabled: false"
-      renderer="colorManagement: true; physicallyCorrectLights: true;">
-    <a-entity camera></a-entity>
-    <a-entity mindar-image-target="targetIndex: 0">
-      <a-entity id="animHeart" position="0 0 0">
-        <a-sphere radius="0.01" color="#ff7ac8" opacity="0.85"
-          animation__appear="property: scale; from: 0 0 0; to: 0.15 0.15 0.15; dur: 800; easing: easeOutQuad; loop: true; dir: alternate"
-          animation__pulse="property: opacity; from: 0.5; to: 1; dur: 1000; loop: true; dir: alternate"
-          animation__spin="property: rotation; to: 0 360 0; dur: 5000; loop: true">
-        </a-sphere>
-        <a-ring radius-inner="0.02" radius-outer="0.022" color="#ff9bd5" opacity="0.7" rotation="-90 0 0"
-          animation__grow="property: scale; from: 0.1 0.1 0.1; to: 2 2 2; dur: 2000; loop: true"
-          animation__fade="property: opacity; from: 0.8; to: 0; dur: 2000; loop: true">
-        </a-ring>
-      </a-entity>
-    </a-entity>
-  </a-scene>
+  <!-- OpenCV.js (CDN) -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="console.log('OpenCV cargado')"></script>
 
   <script>
-(async function(){
-  const LOG = (s) => { console.log(s); const d = document.getElementById('log'); if(d) d.textContent = s; };
+  // CONFIG
+  const TARGET_URL = './target.png'; // ya debe estar en la misma carpeta
+  const MATCH_THRESHOLD = 0.70;      // ajuste: cuanto más alto, más estricto
+
+  // ELEMENTOS
+  const cam = document.getElementById('cam');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
   const startBtn = document.getElementById('startBtn');
-  const sceneEl = document.getElementById('arScene');
+  const logEl = document.getElementById('log');
 
-  const rawUrl = "https://raw.githubusercontent.com/xTorres97/Camisasqr/master/targets.mind";
+  let videoStream = null;
+  let streaming = false;
+  let srcMat = null, grayMat = null, templMat = null, templGray = null, resMat = null;
 
-  try {
-    LOG('Descargando targets.mind desde raw...');
-    const resp = await fetch(rawUrl);
-    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' al descargar targets.mind');
-    const arr = await resp.arrayBuffer();
-    LOG('targets.mind descargado: ' + arr.byteLength + ' bytes — creando blob...');
-    const blob = new Blob([arr], {type: 'application/octet-stream'});
-    const blobUrl = URL.createObjectURL(blob);
+  // ANIMACIÓN: parámetros
+  let animStart = null;
+  const ANIM_PERIOD = 5000; // 5s loop
+  function drawHeart(x, y, w, h, t){
+    // x,y in canvas coords = center of matched box
+    // draw a glowing pulsing heart using canvas
+    const maxR = Math.min(w,h) * 0.6;
+    const pulse = 0.75 + 0.25 * Math.sin(t/200);
+    const r = maxR * pulse;
+    // glow
+    ctx.save();
+    const grad = ctx.createRadialGradient(x, y, r*0.1, x, y, r*1.2);
+    grad.addColorStop(0, 'rgba(255,122,200,0.95)');
+    grad.addColorStop(0.5, 'rgba(255,122,200,0.45)');
+    grad.addColorStop(1, 'rgba(255,122,200,0.0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(x, y, r*1.4, 0, Math.PI*2);
+    ctx.fill();
 
-    // Espera a que AFRAME exista y esté listo
-    if (typeof AFRAME === 'undefined') {
-      LOG('Esperando a AFRAME...');
-      await new Promise(r => {
-        let t = 0;
-        const wait = setInterval(() => {
-          t += 50;
-          if (typeof AFRAME !== 'undefined' || t > 3000) {
-            clearInterval(wait);
-            r();
-          }
-        }, 50);
-      });
-    }
-
-    // Asignar la propiedad usando objeto (evita problemas de parseo con blob:)
-    LOG('Asignando blobUrl al componente mindar-image (objeto) ...');
-    sceneEl.setAttribute('mindar-image', { imageTargetSrc: blobUrl, autoStart: false });
-
-    // Pequeña pausa para que A-Frame registre el cambio
-    await new Promise(r => setTimeout(r, 120));
-
-    // Cargar la librería MindAR (solo ahora)
-    LOG('Cargando script mindar-image-aframe.prod.js dinámicamente...');
-    await new Promise((resolve, reject) => {
-      const s = document.createElement('script');
-      s.src = "https://cdn.jsdelivr.net/npm/mind-ar@1.1.4/dist/mindar-image-aframe.prod.js";
-      s.onload = () => { LOG('Script MindAR cargado.'); resolve(); };
-      s.onerror = (e) => { reject(new Error('No se pudo cargar la librería MindAR: ' + e)); };
-      document.head.appendChild(s);
-    });
-
-    // Espera pequeña a que el componente se registre
-    await new Promise(r => setTimeout(r, 150));
-
-    // Habilitar botón
-    startBtn.style.display = 'inline-block';
-    startBtn.disabled = false;
-    LOG('Listo: pulsa "Activar AR" para iniciar la cámara.');
-
-  } catch (e) {
-    LOG('ERROR carga .mind o script: ' + (e && e.message ? e.message : e));
-    alert('Error cargando targets.mind o la librería MindAR: ' + (e && e.message ? e.message : e));
-    console.error(e);
+    // simple heart shape (path)
+    ctx.translate(x, y);
+    ctx.scale(r/50, r/50);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(0, -25, -50, -25, -50, 0);
+    ctx.bezierCurveTo(-50, 30, -20, 55, 0, 75);
+    ctx.bezierCurveTo(20, 55, 50, 30, 50, 0);
+    ctx.bezierCurveTo(50, -25, 0, -25, 0, 0);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255,120,200,0.95)';
+    ctx.fill();
+    ctx.restore();
   }
-})();
-</script>
 
+  function log(s){ logEl.textContent = s; }
+
+  // Inicia video
+  async function startCamera(){
+    try {
+      videoStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+      cam.srcObject = videoStream;
+      await cam.play();
+      streaming = true;
+      resizeCanvas();
+      prepareOpenCV();
+    } catch(e){
+      alert('Error al abrir la cámara: ' + e.message);
+      console.error(e);
+    }
+  }
+
+  function stopCamera(){
+    if (videoStream) {
+      videoStream.getTracks().forEach(t => t.stop());
+      streaming = false;
+    }
+  }
+
+  function resizeCanvas(){
+    overlay.width = cam.videoWidth;
+    overlay.height = cam.videoHeight;
+    overlay.style.width = cam.clientWidth + 'px';
+    overlay.style.height = cam.clientHeight + 'px';
+  }
+
+  // PREPARAR OpenCV: cargar template image
+  async function prepareOpenCV(){
+    // Esperar a que OpenCV esté listo
+    log('esperando OpenCV...');
+    if (typeof cv === 'undefined' || !cv.imread) {
+      // poll hasta que cargue
+      let waited=0;
+      while((typeof cv === 'undefined' || !cv.imread) && waited < 5000){
+        await new Promise(r=>setTimeout(r,100));
+        waited += 100;
+      }
+    }
+    if (typeof cv === 'undefined' || !cv.imread){
+      alert('OpenCV no se cargó. Recarga la página.');
+      return;
+    }
+    log('OpenCV listo — cargando template...');
+    // Cargar imagen de referencia en una imagen DOM oculta
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = TARGET_URL + '?v=' + Date.now(); // cache-busting
+    img.onload = () => {
+      // crear canvas temporal para leer con OpenCV
+      const tmp = document.createElement('canvas');
+      tmp.width = img.width; tmp.height = img.height;
+      const tctx = tmp.getContext('2d');
+      tctx.drawImage(img,0,0);
+      templMat = cv.imread(tmp);
+      templGray = new cv.Mat();
+      cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
+      log('Template cargado: ' + img.width + 'x' + img.height);
+      // inicializar mats para frames
+      srcMat = new cv.Mat(cam.videoHeight, cam.videoWidth, cv.CV_8UC4);
+      grayMat = new cv.Mat(cam.videoHeight, cam.videoWidth, cv.CV_8UC1);
+      // result matrix size = W - w +1, H - h +1
+      resMat = new cv.Mat(cam.videoHeight - templGray.rows + 1, cam.videoWidth - templGray.cols + 1, cv.CV_32FC1);
+      animStart = performance.now();
+      requestAnimationFrame(processFrame);
+    };
+    img.onerror = (e) => {
+      alert('No se pudo cargar target.png desde: ' + TARGET_URL);
+      console.error(e);
+    };
+  }
+
+  // procesamiento por frame: matchTemplate
+  function processFrame(now){
+    if (!streaming) return;
+    try {
+      // asegurar que tamaños de mats concuerden (si la cam cambió resolución)
+      if (srcMat.cols !== cam.videoWidth || srcMat.rows !== cam.videoHeight) {
+        // liberar y recrear mats con nuevo tamaño
+        if (srcMat) srcMat.delete();
+        if (grayMat) grayMat.delete();
+        if (resMat) resMat.delete();
+        srcMat = new cv.Mat(cam.videoHeight, cam.videoWidth, cv.CV_8UC4);
+        grayMat = new cv.Mat(cam.videoHeight, cam.videoWidth, cv.CV_8UC1);
+        resMat = new cv.Mat(cam.videoHeight - templGray.rows + 1, cam.videoWidth - templGray.cols + 1, cv.CV_32FC1);
+      }
+
+      // leer frame de video
+      ctx.clearRect(0,0,overlay.width, overlay.height);
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = cam.videoWidth; tempCanvas.height = cam.videoHeight;
+      const tctx = tempCanvas.getContext('2d');
+      tctx.drawImage(cam, 0, 0, tempCanvas.width, tempCanvas.height);
+
+      // convertir a mat y grayscale
+      srcMat = cv.imread(tempCanvas);
+      cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
+
+      // matchTemplate
+      cv.matchTemplate(grayMat, templGray, resMat, cv.TM_CCOEFF_NORMED);
+      // localizar el mejor match
+      let minVal = {value:0}, maxVal = {value:0}, minLoc = {x:0,y:0}, maxLoc = {x:0,y:0};
+      cv.minMaxLoc(resMat, minVal, maxVal, minLoc, maxLoc);
+      const best = maxVal.value;
+      // opcional: dibujar debug
+      // ctx.fillStyle = 'white'; ctx.fillText('best: ' + best.toFixed(3), 10, 20);
+
+      if (best >= MATCH_THRESHOLD) {
+        // calc center of matched region
+        const matchX = maxLoc.x + templGray.cols/2;
+        const matchY = maxLoc.y + templGray.rows/2;
+        // dibujar rectángulo de match (opcional)
+        ctx.strokeStyle = 'rgba(255,120,200,0.9)';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(maxLoc.x, maxLoc.y, templGray.cols, templGray.rows);
+
+        // dibujar animación corazón en el centro
+        const elapsed = now - animStart;
+        // adaptar coordenadas si video está espejo por CSS (video está mirrored)
+        // cam video está flip-x via CSS; invertimos X para overlay correcto
+        const canvasW = overlay.width, canvasH = overlay.height;
+        const drawX = canvasW - (matchX);
+        const drawY = matchY;
+        drawHeart(drawX, drawY, templGray.cols, templGray.rows, elapsed);
+      }
+      // liberar tempCanvas mat
+      srcMat.delete(); // creamos uno nuevo cada frame para evitar leaks (cuidado con rendimiento)
+    } catch(err) {
+      console.error('Error en procesamiento frame:', err);
+    } finally {
+      requestAnimationFrame(processFrame);
+    }
+  }
+
+  // Start button
+  startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+    startBtn.style.display = 'none';
+    log('Activando cámara...');
+    await startCamera();
+  });
+
+  // Si la página redimensiona, ajustar canvas
+  window.addEventListener('resize', () => {
+    if (streaming) resizeCanvas();
+  });
+
+  // antes de cerrar, liberar mats
+  window.addEventListener('pagehide', () => {
+    try {
+      if (srcMat) srcMat.delete();
+      if (grayMat) grayMat.delete();
+      if (templMat) templMat.delete();
+      if (templGray) templGray.delete();
+      if (resMat) resMat.delete();
+    } catch(e){}
+    stopCamera();
+  });
+
+  </script>
 </body>
 </html>
