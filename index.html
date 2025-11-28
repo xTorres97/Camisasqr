@@ -2,12 +2,13 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Video Overlay</title>
+  <title>AR Camiseta - Video Overlay (sin espejo)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
-    video#cam{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);} /* espejo para UX */
+    /* <- QUITAMOS el transform:scaleX(-1); para evitar efecto espejo */
+    video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
     #fxVideo{position:fixed; left:0; top:0; transform-origin:center center; display:none; pointer-events:none; z-index:30;}
     #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:40}
@@ -24,7 +25,6 @@
   <!-- Video de efecto (tu archivo). Debes subir animacion.webm a la misma carpeta -->
   <video id="fxVideo" autoplay loop muted playsinline preload="auto" style="will-change:transform;">
     <source src="./animacion.webm" type="video/webm">
-    <!-- Si quieres añadir mp4 fallback, añádelo aquí (sin alpha) -->
   </video>
 
   <button id="startBtn">Activar AR</button>
@@ -36,9 +36,9 @@
 
 <script>
 /* ========== CONFIG ========== */
-const TARGET_URL = './target.png';   // debe existir en la misma carpeta
-let MATCH_THRESHOLD = 0.65;          // ajusta (0.55..0.80)
-let RES_SCALE = 0.6;                 // 0.5-0.8; aumenta si templ > proc area
+const TARGET_URL = './target.png';   // Debe existir en la misma carpeta
+let MATCH_THRESHOLD = 0.65;          // Ajusta entre 0.55 - 0.80 según pruebas
+let RES_SCALE = 0.6;                 // 0.5-0.8; aumenta si template > proc area
 /* ============================ */
 
 const cam = document.getElementById('cam');
@@ -89,7 +89,7 @@ function drawHeart(x, y, w, h, t){
   ctx.restore();
 }
 
-/* ---------- Video overlay control ---------- */
+/* ---------- Video overlay control (no mirror math) ---------- */
 function showVideoOverlay(cx, cy, w, h){
   if (!fxVideo) return;
   // cx,cy center in overlay canvas coords
@@ -285,23 +285,21 @@ function processFrame(now){
       const matchX = maxLoc.x + templGray.cols/2;
       const matchY = maxLoc.y + templGray.rows/2;
 
-      const drawX = overlay.width - (matchX * scaleX); // mirror
-      const drawY = matchY * scaleY;
+      // --- YA NO INVERTIMOS X: coordenadas normales ---
+      const drawX = (matchX * scaleX);
+      const drawY = (matchY * scaleY);
       const drawW = templGray.cols * scaleX;
       const drawH = templGray.rows * scaleY;
 
-      // dibuja rect (debug)
+      // dibuja rect (debug) en coordenadas normales
       ctx.strokeStyle = 'rgba(255,120,200,0.9)';
       ctx.lineWidth = 4;
-      ctx.strokeRect(overlay.width - ((maxLoc.x + templGray.cols) * scaleX), maxLoc.y * scaleY, drawW, drawH);
+      ctx.strokeRect(maxLoc.x * scaleX, maxLoc.y * scaleY, drawW, drawH);
 
       // mostrar video overlay posicionado (o fallback)
-      // fxVideo espera coordenadas en canvas (center)
       showVideoOverlay(drawX, drawY, drawW, drawH);
     } else {
       hideVideoOverlay();
-      // opcional fallback: dibujar corazón si quieres cuando no haya video
-      // drawHeart(overlay.width/2, overlay.height/2, 200, 200, now - animStart);
     }
 
   } catch(err) {
