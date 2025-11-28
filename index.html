@@ -4,6 +4,35 @@
   <meta charset="utf-8" />
   <title>AR Camiseta - Debug</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <script>
+(async function(){
+  const rawUrl = "https://raw.githubusercontent.com/xTorres97/Camisasqr/master/targets.mind";
+  try {
+    const resp = await fetch(rawUrl);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const arr = await resp.arrayBuffer();
+    const blob = new Blob([arr], {type: 'application/octet-stream'});
+    const blobUrl = URL.createObjectURL(blob);
+    // Establece dinámicamente la ruta de imageTargetSrc para MindAR
+    const sceneEl = document.querySelector('a-scene');
+    // Si no existe aún la escena, espera un poco
+    if (!sceneEl) {
+      console.warn('a-scene no encontrado, intentando de nuevo en 200ms');
+      setTimeout(()=> {
+        const sc = document.querySelector('a-scene');
+        if (sc) sc.setAttribute('mindar-image', 'imageTargetSrc: ' + blobUrl + '; autoStart: false;');
+      }, 200);
+    } else {
+      sceneEl.setAttribute('mindar-image', 'imageTargetSrc: ' + blobUrl + '; autoStart: false;');
+    }
+    console.log('targets.mind cargado desde raw -> blob URL');
+  } catch (e) {
+    console.error('No se pudo cargar targets.mind desde raw:', e);
+    alert('Error cargando targets.mind: ' + e.message + '. Revisa que la URL raw exista o sube el archivo correctamente.');
+  }
+})();
+</script>
+
   <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.1.4/dist/mindar-image-aframe.prod.js"></script>
   <style>
