@@ -2,14 +2,23 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - ORB Matching (skip frames) - corregido</title>
+  <title>AR Camiseta - ORB Matching (mejorado)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
     video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
-    #fxVideo{position:fixed; left:0; top:0; transform-origin:center center; display:none; pointer-events:none; z-index:9999; background:transparent;}
+    #fxVideo{
+      position:fixed;
+      left:0; top:0;
+      transform-origin:center center;
+      display:none;
+      pointer-events:none;
+      z-index:9999;
+      background:transparent;
+      will-change:transform;
+    }
     #controls{position:fixed; right:12px; top:60px; z-index:10000; display:flex; flex-direction:column; gap:8px}
     .ctrlBtn{padding:10px 12px;border-radius:8px;border:none;background:#ff4fa8;color:#fff;font-weight:600}
     #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:40}
@@ -25,7 +34,7 @@
   </div>
 
   <!-- Video efecto -->
-  <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="will-change:transform;">
+  <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous">
     <source src="./animacion.webm" type="video/webm">
   </video>
 
@@ -39,18 +48,15 @@
   <div id="log">listo</div>
   <div id="bigMatch">Match: --</div>
 
-  <!-- OpenCV.js -->
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 
 <script>
-/* ========== CONFIG ==========
-  Ajusta según pruebas.
-=============================*/
+/* ========== CONFIG ========== */
 const TARGET_URL = './target_cropped_512.png';
-let RES_SCALE = 1.0;         // 0.7-1.0 dependiendo CPU; 1.0 usa máxima resolución
-let FRAME_SKIP = 2;          // procesar cada N frames (1 = siempre)
+let RES_SCALE = 0.7;         // **reducido para mejorar velocidad**
+let FRAME_SKIP = 2;          // procesar cada N frames
 let MATCH_RATIO = 0.75;      // ratio test Lowe
-let minMatchCount = 8;       // mínimo good matches para homografía
+let minMatchCount = 6;       // menos exigente para detectar antes
 /* =========================== */
 
 const cam = document.getElementById('cam');
@@ -81,7 +87,7 @@ let frameCounter = 0;
 
 function log(s){ logEl.textContent = s; console.log(s); }
 
-/* autoplay permission helper */
+/* autoplay helper */
 function showPlayHint(){
   if (document.getElementById('playHint')) return;
   const b = document.createElement('button');
@@ -92,44 +98,38 @@ function showPlayHint(){
   document.body.appendChild(b);
 }
 
-/* ========== overlay video control ========== */
-function showVideoOverlay(cx, cy, w, h){
+/* show/hide overlay with rotation and center anchoring */
+function showVideoOverlayCentered(cx, cy, w, h, angleDeg=0){
   if (!fxVideo) return;
-  log("Mostrando video — readyState:" + fxVideo.readyState + " paused:" + fxVideo.paused);
-
-  const left = cx - w/2;
-  const top = cy - h/2;
+  // cx,cy are CENTER coords in overlay canvas pixels
   const rect = overlay.getBoundingClientRect();
-  const absLeft = rect.left + left + window.scrollX;
-  const absTop  = rect.top  + top  + window.scrollY;
+  const screenX = rect.left + cx + window.scrollX;
+  const screenY = rect.top + cy + window.scrollY;
 
-  Object.assign(fxVideo.style, {
-    position:'fixed',
-    left: absLeft + 'px',
-    top: absTop + 'px',
-    width: Math.max(10, w) + 'px',
-    height: Math.max(10, h) + 'px',
-    display:'block',
-    visibility:'visible',
-    zIndex:9999,
-    objectFit:'contain'
-  });
+  fxVideo.style.display = 'block';
+  fxVideo.style.visibility = 'visible';
+  fxVideo.style.left = (screenX) + 'px';
+  fxVideo.style.top  = (screenY) + 'px';
+  fxVideo.style.width = Math.max(10, w) + 'px';
+  fxVideo.style.height = Math.max(10, h) + 'px';
+  fxVideo.style.objectFit = 'cover'; // fill box and crop if aspect differs
+  fxVideo.style.transform = `translate(-50%,-50%) rotate(${angleDeg}deg)`;
 
   if (fxVideo.paused) {
     fxVideo.play().then(()=>{ log('video play ok'); }).catch(err=>{ log('video play err: '+err); showPlayHint(); });
   }
 }
-function hideVideoOverlay(){ if (!fxVideo) return; try{ fxVideo.pause(); }catch(e){} fxVideo.style.display='none'; fxVideo.style.visibility='hidden'; }
+function hideVideoOverlay(){ if (!fxVideo) return; try{ fxVideo.pause(); }catch(e){} fxVideo.style.display='none'; fxVideo.style.visibility='hidden'; fxVideo.style.transform='translate(-50%,-50%)'; }
 
 /* test buttons */
 testShow.addEventListener('click', ()=>{
   const rect = overlay.getBoundingClientRect();
   const cx = rect.width/2, cy = rect.height/2;
-  showVideoOverlay(cx, cy, rect.width*0.55, rect.height*0.55);
+  showVideoOverlayCentered(cx, cy, rect.width*0.55, rect.height*0.55, 0);
 });
 testHide.addEventListener('click', ()=>{ hideVideoOverlay(); });
 
-/* ========== camera start/stop ========== */
+/* camera */
 async function startCamera(){
   try {
     videoStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
@@ -146,7 +146,7 @@ async function startCamera(){
 function stopCamera(){ if (videoStream) videoStream.getTracks().forEach(t=>t.stop()); streaming = false; }
 function resizeCanvas(){ overlay.width = cam.videoWidth; overlay.height = cam.videoHeight; overlay.style.width = cam.clientWidth + 'px'; overlay.style.height = cam.clientHeight + 'px'; }
 
-/* ========== prepareOpenCV (ORB) ========== */
+/* prepareOpenCV (ORB) */
 async function prepareOpenCV(){
   log("Esperando OpenCV...");
   if (typeof cv === "undefined" || !cv.imread){
@@ -164,10 +164,8 @@ async function prepareOpenCV(){
   img.src = TARGET_URL + "?v=" + Date.now();
 
   img.onload = () => {
-    // read template into canvas
     const tmp = document.createElement('canvas');
-    tmp.width = img.width;
-    tmp.height = img.height;
+    tmp.width = img.width; tmp.height = img.height;
     const tctx = tmp.getContext('2d');
     tctx.drawImage(img, 0, 0);
 
@@ -181,18 +179,30 @@ async function prepareOpenCV(){
     templGray = new cv.Mat();
     cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
 
-    // equalize to improve contrast
     try { let eq = new cv.Mat(); cv.equalizeHist(templGray, eq); templGray.delete(); templGray = eq; } catch(e){}
+
+    // -> OPTIONAL: rescale template smaller if you want even faster (e.g. 0.85)
+    // (leave commented, you can enable if needed)
+    // {
+    //   const scale = 0.9;
+    //   const w = Math.max(8, Math.round(templGray.cols * scale));
+    //   const h = Math.max(8, Math.round(templGray.rows * scale));
+    //   const tmp2 = document.createElement('canvas'); tmp2.width = w; tmp2.height = h;
+    //   tmp2.getContext('2d').drawImage(tmp,0,0,tmp.width,tmp.height,0,0,w,h);
+    //   templMat.delete(); templGray.delete();
+    //   templMat = cv.imread(tmp2);
+    //   templGray = new cv.Mat();
+    //   cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
+    // }
 
     // init ORB & BFMatcher
     try {
-      orb = new cv.ORB(); // may work on many builds
+      orb = new cv.ORB();
     } catch(e){
       try { orb = new cv.ORB(); } catch(err){ console.warn("ORB not available in this build:", err); }
     }
     bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
 
-    // detect & compute template keypoints/descriptors
     templKeypoints = new cv.KeyPointVector();
     templDescriptors = new cv.Mat();
     try {
@@ -214,8 +224,7 @@ async function prepareOpenCV(){
     const procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
     const procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
     procCanvas = document.createElement('canvas');
-    procCanvas.width = procW;
-    procCanvas.height = procH;
+    procCanvas.width = procW; procCanvas.height = procH;
     procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
 
     if (srcMat) { srcMat.delete(); srcMat = null; }
@@ -231,33 +240,25 @@ async function prepareOpenCV(){
   img.onerror = e => { alert("No se pudo cargar " + TARGET_URL); console.error(e); };
 }
 
-/* ========== processFrame (ORB + FRAME_SKIP) - CORREGIDO para DMatch sin .delete() ========== */
+/* processFrame (ORB + FRAME_SKIP) with rotation & center overlay */
 function processFrame(now){
   if (!streaming) return;
-
   try {
-    // frame skipping
     frameCounter = (frameCounter + 1) % FRAME_SKIP;
 
     const pW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
     const pH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
 
-    // recreate mats if resolution changed
     if (!procCanvas || procCanvas.width !== pW || procCanvas.height !== pH){
       if (srcMat) { srcMat.delete(); srcMat = null; }
       if (grayMat) { grayMat.delete(); grayMat = null; }
-
-      procCanvas = document.createElement('canvas');
-      procCanvas.width = pW; procCanvas.height = pH;
+      procCanvas = document.createElement('canvas'); procCanvas.width = pW; procCanvas.height = pH;
       procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
-
       srcMat = new cv.Mat(pH, pW, cv.CV_8UC4);
       grayMat = new cv.Mat(pH, pW, cv.CV_8UC1);
-
       log('Reiniciado procesador: ' + pW + 'x' + pH);
     }
 
-    // always update reduced canvas
     procCtx.drawImage(cam, 0, 0, pW, pH);
     const imageData = procCtx.getImageData(0,0,pW,pH);
     if (srcMat && srcMat.data && srcMat.data.length === imageData.data.length){
@@ -266,16 +267,13 @@ function processFrame(now){
       srcMat = cv.imread(procCanvas);
     }
 
-    // if not processing frame, keep last overlay and return
     if (frameCounter !== 0){
       requestAnimationFrame(processFrame);
       return;
     }
 
-    // heavy processing begins
     cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
 
-    // detect + compute on frame
     let frameKeypoints = new cv.KeyPointVector();
     let frameDescriptors = new cv.Mat();
     try {
@@ -295,7 +293,6 @@ function processFrame(now){
     const tplK = templKeypoints ? templKeypoints.size() : 0;
     const frmK = frameKeypoints ? frameKeypoints.size() : 0;
 
-    // if no keypoints -> skip
     if (!tplK || !frmK){
       ctx.clearRect(0,0,overlay.width, overlay.height);
       ctx.fillStyle='white'; ctx.font='16px Arial';
@@ -306,7 +303,6 @@ function processFrame(now){
       return;
     }
 
-    // knnMatch
     let matches = new cv.DMatchVectorVector();
     try {
       bf.knnMatch(frameDescriptors, templDescriptors, matches, 2);
@@ -315,8 +311,7 @@ function processFrame(now){
       catch(err){ console.error('BFMatcher.knnMatch failed', err); matches.delete(); frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; }
     }
 
-    // === ratio test (seguro para builds donde DMatch no tiene .delete()) ===
-    // goodMatches will be plain JS objects: { queryIdx, trainIdx, distance }
+    // ratio test -> plain JS objects
     let goodMatches = [];
     for (let i = 0; i < matches.size(); i++) {
       const mv = matches.get(i);
@@ -326,22 +321,15 @@ function processFrame(now){
         if (m.distance <= MATCH_RATIO * n.distance) {
           goodMatches.push({ queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance });
         }
-        // do NOT call m.delete() or n.delete() — not safe in this build
       } else if (mv.size() === 1) {
         const m = mv.get(0);
-        if (m.distance < 30) {
-          goodMatches.push({ queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance });
-        }
+        if (m.distance < 30) { goodMatches.push({ queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance }); }
       }
-      // delete the DMatchVector (mv) which does have delete()
       mv.delete();
     }
-    // delete top-level matches container
     matches.delete();
 
-    // insufficient matches?
     if (goodMatches.length < minMatchCount){
-      // no DMatch objects to delete (we stored plain JS objects), just cleanup cv objects
       frameKeypoints.delete(); frameDescriptors.delete();
       ctx.clearRect(0,0,overlay.width, overlay.height);
       ctx.fillStyle='white'; ctx.font='16px Arial';
@@ -352,18 +340,17 @@ function processFrame(now){
       return;
     }
 
-    // build point arrays for homography using plain objects
+    // prepare arrays for homography
     const srcPts = [];
     const dstPts = [];
     for (let i=0; i<goodMatches.length; i++){
       const gm = goodMatches[i];
-      const queryIdx = gm.queryIdx; // index in frame
-      const trainIdx = gm.trainIdx; // index in template
+      const queryIdx = gm.queryIdx;
+      const trainIdx = gm.trainIdx;
       const kpFrame = frameKeypoints.get(queryIdx);
       const kpTpl = templKeypoints.get(trainIdx);
       srcPts.push(kpFrame.pt.x, kpFrame.pt.y);
       dstPts.push(kpTpl.pt.x, kpTpl.pt.y);
-      // do NOT delete kpFrame/kpTpl here
     }
 
     let srcMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPts);
@@ -371,7 +358,6 @@ function processFrame(now){
     let mask = new cv.Mat();
     let H = cv.findHomography(srcMatPts, dstMatPts, cv.RANSAC, 5.0, mask);
 
-    // count inliers
     let inliers = 0;
     for (let i=0; i<mask.rows; i++){
       if (mask.ucharPtr(i,0)[0]) inliers++;
@@ -382,12 +368,11 @@ function processFrame(now){
     ctx.fillText('Matches: ' + goodMatches.length + ' inliers:' + inliers,10,20);
     bigMatch.textContent = 'Matches: ' + goodMatches.length + ' | Inliers: ' + inliers;
 
-    if (!H.empty() && inliers >= Math.max(6, Math.floor(goodMatches.length * 0.3))){
-      // invert homography to map template -> frame
+    if (!H.empty() && inliers >= Math.max(5, Math.floor(goodMatches.length * 0.25))){
+      // invert homography -> template -> frame
       let H_inv = new cv.Mat();
       cv.invert(H, H_inv, cv.DECOMP_LU);
 
-      // template corners
       const tw = templGray.cols, th = templGray.rows;
       const tplCorners = cv.matFromArray(4,1,cv.CV_32FC2, [0,0, tw,0, tw,th, 0,th]);
       let dstCorners = new cv.Mat();
@@ -403,12 +388,18 @@ function processFrame(now){
 
       const minX = Math.min(x0,x1,x2,x3), maxX = Math.max(x0,x1,x2,x3);
       const minY = Math.min(y0,y1,y2,y3), maxY = Math.max(y0,y1,y2,y3);
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
       const drawW = (maxX - minX) * scaleX;
       const drawH = (maxY - minY) * scaleY;
-      const drawX = (minX + (maxX - minX)/2) * scaleX;
-      const drawY = (minY + (maxY - minY)/2) * scaleY;
+      const drawCX = centerX * scaleX;
+      const drawCY = centerY * scaleY;
 
-      // draw polygon for debug
+      // compute angle from corner0 -> corner1 (in frame coordinates)
+      const angleRad = Math.atan2(y1 - y0, x1 - x0);
+      const angleDeg = angleRad * 180 / Math.PI;
+
+      // debug polygon
       ctx.strokeStyle = 'rgba(0,255,150,0.95)';
       ctx.lineWidth = 4;
       ctx.beginPath();
@@ -419,8 +410,8 @@ function processFrame(now){
       ctx.closePath();
       ctx.stroke();
 
-      // show animation overlay
-      showVideoOverlay(drawX, drawY, drawW, drawH);
+      // show video overlay centered and rotated
+      showVideoOverlayCentered(drawCX, drawCY, drawW, drawH, angleDeg);
 
       tplCorners.delete(); dstCorners.delete(); H_inv.delete();
     } else {
@@ -430,8 +421,6 @@ function processFrame(now){
     // cleanup
     srcMatPts.delete(); dstMatPts.delete(); mask.delete();
     if (H && !H.isDeleted) H.delete();
-
-    // delete frame keypoints/descriptors
     frameKeypoints.delete(); frameDescriptors.delete();
 
   } catch(err){
@@ -441,7 +430,7 @@ function processFrame(now){
   }
 }
 
-/* ========== start button ========== */
+/* start */
 startBtn.addEventListener('click', async ()=>{
   startBtn.disabled = true;
   startBtn.style.display = 'none';
@@ -449,7 +438,7 @@ startBtn.addEventListener('click', async ()=>{
   await startCamera();
 });
 
-/* ========== cleanup on pagehide ========== */
+/* cleanup */
 window.addEventListener('pagehide', ()=>{
   try {
     if (srcMat) { srcMat.delete(); srcMat = null; }
