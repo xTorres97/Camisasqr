@@ -2,17 +2,20 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Video Overlay (sin espejo)</title>
+  <title>AR Camiseta - Debug & Fix</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
     video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
-    #fxVideo{position:fixed; left:0; top:0; transform-origin:center center; display:none; pointer-events:none; z-index:30;}
+    #fxVideo{position:fixed; left:0; top:0; transform-origin:center center; display:none; pointer-events:none; z-index:9999; background:transparent;}
+    #controls{position:fixed; right:12px; top:60px; z-index:10000; display:flex; flex-direction:column; gap:8px}
+    .ctrlBtn{padding:10px 12px;border-radius:8px;border:none;background:#ff4fa8;color:#fff;font-weight:600}
     #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:40}
     #note{position:fixed;left:0;right:0;bottom:10px;text-align:center;z-index:40;opacity:0.9}
     #log{position:fixed;left:8px;top:8px;background:rgba(0,0,0,0.6);padding:6px 8px;border-radius:6px;font-size:12px;z-index:40}
+    #bigMatch{position:fixed;left:8px;top:48px;font-size:22px;font-weight:700;color:#fff;text-shadow:0 0 6px #000;z-index:40}
   </style>
 </head>
 <body>
@@ -21,306 +24,231 @@
     <canvas id="overlay"></canvas>
   </div>
 
-  <!-- ANIMACION WEBM -->
-  <video id="fxVideo" autoplay loop muted playsinline preload="auto" style="will-change:transform;">
+  <!-- Video effect -->
+  <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="will-change:transform;">
     <source src="./animacion.webm" type="video/webm">
   </video>
+
+  <div id="controls">
+    <button id="testShow" class="ctrlBtn">Mostrar animación de prueba</button>
+    <button id="testHide" class="ctrlBtn">Ocultar animación prueba</button>
+  </div>
 
   <button id="startBtn">Activar AR</button>
   <div id="note">Apunta la cámara hacia la imagen de la camiseta</div>
   <div id="log">listo</div>
+  <div id="bigMatch">Match: --</div>
 
-  <!-- OpenCV.js -->
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 
 <script>
-/* ========== CONFIG ========== */
-const TARGET_URL = './target_cropped_512.png'; // usa el recorte 512
-let MATCH_THRESHOLD = 0.65;  
-let RES_SCALE = 0.9;               // normalmente 0.8-1.0 para marker 512
-/* ============================ */
+/* CONFIG */
+const TARGET_URL = './target_cropped_512.png';
+let MATCH_THRESHOLD = 0.50;   // bajado para probar; ajusta luego
+let RES_SCALE = 1.0;          // usar resolución completa para evitar "template too large"
+/* end config */
 
 const cam = document.getElementById('cam');
 const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
 const startBtn = document.getElementById('startBtn');
 const logEl = document.getElementById('log');
+const bigMatch = document.getElementById('bigMatch');
 const fxVideo = document.getElementById('fxVideo');
+const testShow = document.getElementById('testShow');
+const testHide = document.getElementById('testHide');
 
-let videoStream = null;
-let streaming = false;
-
-let srcMat = null, grayMat = null, templMat = null, templGray = null, resMat = null;
-let procCanvas = null, procCtx = null;
-let animStart = null;
+let videoStream = null, streaming = false;
+let srcMat=null, grayMat=null, templMat=null, templGray=null, resMat=null;
+let procCanvas=null, procCtx=null; let animStart=null;
 
 function log(s){ logEl.textContent = s; console.log(s); }
 
-/* ========== helper autoplay hint ========== */
+/* autoplay helper */
 function showPlayHint(){
   if (document.getElementById('playHint')) return;
   const b = document.createElement('button');
-  b.id = 'playHint';
-  b.textContent = 'Toca para reproducir animación';
-  Object.assign(b.style, {
-    position:'fixed', left:'50%', top:'70%',
-    transform:'translate(-50%,-50%)', zIndex:99999,
-    padding:'12px 18px', background:'#ff4fa8', color:'#fff',
-    border:'none', borderRadius:'8px', fontSize:'16px'
-  });
-  b.onclick = () => { fxVideo.play().catch(()=>{}); b.remove(); };
+  b.id='playHint';
+  b.textContent='Toca para reproducir animación';
+  Object.assign(b.style, {position:'fixed',left:'50%',top:'75%',transform:'translate(-50%,-50%)',zIndex:100000,padding:'12px 16px',background:'#ff4fa8',color:'#fff',border:'none',borderRadius:'8px'});
+  b.onclick = ()=>{ fxVideo.play().catch(()=>{}); b.remove(); };
   document.body.appendChild(b);
 }
 
-/* ========== video overlay ========== */
+/* show/hide overlay - improved */
 function showVideoOverlay(cx, cy, w, h){
   if (!fxVideo) return;
-  log("Mostrando video — readyState:" + fxVideo.readyState + " paused:" + fxVideo.paused);
-
-  const left = cx - w/2;
-  const top = cy - h/2;
+  // debug
+  log("showVideoOverlay readyState:"+fxVideo.readyState+" paused:"+fxVideo.paused);
+  // compute top-left in screen coords
+  const left = cx - w/2, top = cy - h/2;
   const rect = overlay.getBoundingClientRect();
   const absLeft = rect.left + left + window.scrollX;
-  const absTop  = rect.top  + top  + window.scrollY;
+  const absTop = rect.top + top + window.scrollY;
 
   Object.assign(fxVideo.style, {
-    position:'fixed', display:'block', zIndex:9999, pointerEvents:'none',
-    left: absLeft + 'px', top: absTop + 'px',
-    width: Math.max(10, w) + 'px', height: Math.max(10, h) + 'px',
-    objectFit:'contain', visibility:'visible', transformOrigin:'center center'
+    position:'fixed',
+    left: absLeft + 'px',
+    top: absTop + 'px',
+    width: Math.max(10, w) + 'px',
+    height: Math.max(10, h) + 'px',
+    display:'block',
+    visibility:'visible',
+    zIndex:9999,
+    objectFit:'contain'
   });
 
+  // force play (startBtn gives gesture)
   if (fxVideo.paused) {
-    fxVideo.play().then(()=>{ log("Video reproducido correctamente."); })
-    .catch(err=>{ log("No se pudo reproducir el video automáticamente: " + err); showPlayHint(); });
+    fxVideo.play().then(()=>{ log('video play ok'); }).catch(err=>{ log('video play err: '+err); showPlayHint(); });
   }
 }
+function hideVideoOverlay(){ if (!fxVideo) return; try{ fxVideo.pause(); }catch(e){} fxVideo.style.display='none'; fxVideo.style.visibility='hidden'; }
 
-function hideVideoOverlay(){
-  if (!fxVideo) return;
-  try{ fxVideo.pause(); } catch(e){}
-  fxVideo.style.display = 'none';
-  fxVideo.style.visibility = 'hidden';
-}
+/* test controls */
+testShow.addEventListener('click', ()=>{
+  // center screen
+  const rect = overlay.getBoundingClientRect();
+  const cx = rect.width/2, cy = rect.height/2;
+  showVideoOverlay(cx, cy, rect.width*0.6, rect.height*0.6);
+});
+testHide.addEventListener('click', ()=>{ hideVideoOverlay(); });
 
-/* ========== cámara ========== */
+/* camera */
 async function startCamera(){
   try {
-    videoStream = await navigator.mediaDevices.getUserMedia({ video:{facingMode:'environment'}, audio:false });
+    videoStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
     cam.srcObject = videoStream;
     await cam.play();
     streaming = true;
     resizeCanvas();
     prepareOpenCV();
-  } catch(e){
-    alert('Error al abrir la cámara: ' + e.message);
-    console.error(e);
-  }
+  } catch(e){ alert('Error al abrir la cámara: '+e.message); console.error(e); }
 }
-function stopCamera(){ if (videoStream) videoStream.getTracks().forEach(t=>t.stop()); streaming = false; }
-function resizeCanvas(){
-  overlay.width = cam.videoWidth;
-  overlay.height = cam.videoHeight;
-  overlay.style.width = cam.clientWidth + 'px';
-  overlay.style.height = cam.clientHeight + 'px';
-}
+function stopCamera(){ if (videoStream) videoStream.getTracks().forEach(t=>t.stop()); streaming=false; }
+function resizeCanvas(){ overlay.width = cam.videoWidth; overlay.height = cam.videoHeight; overlay.style.width = cam.clientWidth+'px'; overlay.style.height = cam.clientHeight+'px'; }
 
-/* ========== preparar OpenCV + template (reescala si es necesario) ========== */
+/* prepare OpenCV + auto-rescale template if needed */
 async function prepareOpenCV(){
-  log("Esperando OpenCV...");
-  if (typeof cv === "undefined" || !cv.imread){
-    let waited=0;
-    while((typeof cv === "undefined" || !cv.imread) && waited<5000){ await new Promise(r=>setTimeout(r,100)); waited+=100; }
+  log('Esperando OpenCV...');
+  if (typeof cv==='undefined' || !cv.imread){
+    let waited=0; while((typeof cv==='undefined' || !cv.imread) && waited<5000){ await new Promise(r=>setTimeout(r,100)); waited+=100; }
   }
-  if (typeof cv === "undefined" || !cv.imread){ alert("OpenCV no cargó"); return; }
+  if (typeof cv==='undefined' || !cv.imread){ alert('OpenCV no cargó'); return; }
+  log('OpenCV listo — cargando template...');
+  const img = new Image(); img.crossOrigin='anonymous'; img.src = TARGET_URL + '?v=' + Date.now();
+  img.onload = ()=>{
+    const tmp = document.createElement('canvas'); tmp.width=img.width; tmp.height=img.height;
+    const tctx = tmp.getContext('2d'); tctx.drawImage(img,0,0);
+    if (templMat) { templMat.delete(); templMat=null; } if (templGray) { templGray.delete(); templGray=null; }
+    templMat = cv.imread(tmp); templGray = new cv.Mat(); cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
 
-  log("OpenCV listo — Cargando template...");
-  const img = new Image();
-  img.crossOrigin = "anonymous";
-  img.src = TARGET_URL + "?v=" + Date.now();
-
-  img.onload = () => {
-    // leer el template original en canvas tmp
-    const tmp = document.createElement('canvas');
-    tmp.width = img.width; tmp.height = img.height;
-    const tctx = tmp.getContext('2d');
-    tctx.drawImage(img,0,0);
-
-    // liberar si existían
-    if (templMat) { templMat.delete(); templMat = null; }
-    if (templGray) { templGray.delete(); templGray = null; }
-
-    // cargar templMat original
-    templMat = cv.imread(tmp);
-    templGray = new cv.Mat();
-    cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
-
-    // calcular area de proceso según RES_SCALE y tamaño actual de video
     const procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
     const procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
 
-    // si el template es más grande que la zona de proceso, reescalarlo para que quepa
-    if (templGray.cols > procW || templGray.rows > procH) {
-      // calcular factor de escala para que el template quepa con un margen (90% por ejemplo)
-      const scale = Math.min((procW * 0.9) / templGray.cols, (procH * 0.9) / templGray.rows);
+    // if template bigger than proc area, rescale template to 90% of proc area
+    if (templGray.cols > procW || templGray.rows > procH){
+      const scale = Math.min((procW*0.9)/templGray.cols, (procH*0.9)/templGray.rows);
       const newW = Math.max(8, Math.round(templMat.cols * scale));
       const newH = Math.max(8, Math.round(templMat.rows * scale));
-      const tmp2 = document.createElement('canvas');
-      tmp2.width = newW; tmp2.height = newH;
-      const tctx2 = tmp2.getContext('2d');
-      // dibujar y reescalar el original en tmp2
-      tctx2.drawImage(tmp, 0, 0, tmp.width, tmp.height, 0, 0, newW, newH);
-
-      // reemplazar templMat/templGray por la versión reescalada
-      templMat.delete();
-      templGray.delete();
-      templMat = cv.imread(tmp2);
-      templGray = new cv.Mat();
-      cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
-
-      log(`Template reescalado a ${templGray.cols}x${templGray.rows} para ajustarse al area ${procW}x${procH}`);
+      const tmp2 = document.createElement('canvas'); tmp2.width=newW; tmp2.height=newH;
+      const t2 = tmp2.getContext('2d'); t2.drawImage(tmp,0,0,tmp.width,tmp.height,0,0,newW,newH);
+      templMat.delete(); templGray.delete();
+      templMat = cv.imread(tmp2); templGray = new cv.Mat(); cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
+      log('Template reescalado a '+templGray.cols+'x'+templGray.rows);
     } else {
-      log(`Template cargado sin reescalar: ${templGray.cols}x${templGray.rows} (proc ${procW}x${procH})`);
+      log('Template cargado: '+templGray.cols+'x'+templGray.rows+' (proc '+procW+'x'+procH+')');
     }
 
-    // inicializar procCanvas y mats reducidos
-    procCanvas = document.createElement('canvas');
-    procCanvas.width = procW; procCanvas.height = procH;
-    procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+    // init proc canvas & mats
+    procCanvas = document.createElement('canvas'); procCanvas.width = procW; procCanvas.height = procH;
+    procCtx = procCanvas.getContext('2d', {willReadFrequently:true});
 
-    if (srcMat) { srcMat.delete(); srcMat = null; }
-    if (grayMat) { grayMat.delete(); grayMat = null; }
-    if (resMat) { resMat.delete(); resMat = null; }
+    if (srcMat) { srcMat.delete(); srcMat=null; } if (grayMat) { grayMat.delete(); grayMat=null; } if (resMat) { resMat.delete(); resMat=null; }
 
     srcMat = new cv.Mat(procH, procW, cv.CV_8UC4);
     grayMat = new cv.Mat(procH, procW, cv.CV_8UC1);
 
-    const resW = procW - templGray.cols + 1;
-    const resH = procH - templGray.rows + 1;
-    if (resW > 0 && resH > 0) {
-      resMat = new cv.Mat(resH, resW, cv.CV_32FC1);
-      log('Preparado: resMat OK');
-    } else {
-      resMat = null;
-      log('AVISO: resMat inválida tras reescalado (template aún no cabe).');
-    }
+    const resW = procW - templGray.cols + 1; const resH = procH - templGray.rows + 1;
+    if (resW>0 && resH>0){ resMat = new cv.Mat(resH, resW, cv.CV_32FC1); log('Preparado: resMat OK'); }
+    else { resMat = null; log('AVISO: resMat inválida'); }
 
     animStart = performance.now();
     requestAnimationFrame(processFrame);
   };
-
-  img.onerror = e => { alert("No se pudo cargar target_cropped_512.png"); console.error(e); };
+  img.onerror = e=>{ alert('No se pudo cargar ' + TARGET_URL); console.error(e); };
 }
 
-/* ========== procesar frame ========== */
+/* process frame */
 function processFrame(now){
   if (!streaming) return;
   try {
     const pW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
     const pH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
 
-    // si la zona de proceso cambió (rotación/resize), recrear mats / procCanvas y asegurarnos que templ cabe
-    if (!procCanvas || procCanvas.width !== pW || procCanvas.height !== pH) {
-      if (srcMat) { srcMat.delete(); srcMat = null; }
-      if (grayMat) { grayMat.delete(); grayMat = null; }
-      if (resMat) { resMat.delete(); resMat = null; }
-
-      procCanvas = document.createElement('canvas');
-      procCanvas.width = pW; procCanvas.height = pH;
-      procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
-
+    if (!procCanvas || procCanvas.width!==pW || procCanvas.height!==pH){
+      if (srcMat) srcMat.delete(); if (grayMat) grayMat.delete(); if (resMat) resMat.delete();
+      procCanvas = document.createElement('canvas'); procCanvas.width=pW; procCanvas.height=pH;
+      procCtx = procCanvas.getContext('2d', {willReadFrequently:true});
       srcMat = new cv.Mat(pH, pW, cv.CV_8UC4);
       grayMat = new cv.Mat(pH, pW, cv.CV_8UC1);
-
-      const resW = pW - (templGray ? templGray.cols : 0) + 1;
-      const resH = pH - (templGray ? templGray.rows : 0) + 1;
-      if (resW > 0 && resH > 0) {
-        resMat = new cv.Mat(resH, resW, cv.CV_32FC1);
-      } else {
-        resMat = null;
-      }
-      log('Reiniciado procesador: ' + pW + 'x' + pH + ' (resMat ' + (resMat ? 'ok' : 'INVALID') + ')');
+      const resW = pW - (templGray?templGray.cols:0) + 1; const resH = pH - (templGray?templGray.rows:0) + 1;
+      if (resW>0 && resH>0) resMat = new cv.Mat(resH, resW, cv.CV_32FC1); else resMat = null;
+      log('Reiniciado procesado: '+pW+'x'+pH+' (resMat '+(resMat?'ok':'INVALID')+')');
     }
 
-    // dibujar video reducido
-    procCtx.drawImage(cam, 0, 0, pW, pH);
+    procCtx.drawImage(cam,0,0,pW,pH);
+    const imageData = procCtx.getImageData(0,0,pW,pH);
+    if (srcMat && srcMat.data && srcMat.data.length === imageData.data.length) srcMat.data.set(imageData.data);
+    else srcMat = cv.imread(procCanvas);
 
-    // leer pixel data en srcMat sin recrearlo
-    const imageData = procCtx.getImageData(0, 0, pW, pH);
-    if (srcMat && srcMat.data && srcMat.data.length === imageData.data.length) {
-      srcMat.data.set(imageData.data);
-    } else {
-      srcMat = cv.imread(procCanvas);
-    }
-
-    // grayscale
     cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
 
-    // si resMat inválida, mostrar aviso y ocultar overlay
-    if (!resMat || resMat.rows <= 0 || resMat.cols <= 0) {
-      ctx.clearRect(0,0,overlay.width, overlay.height);
-      ctx.fillStyle = 'white'; ctx.font = '14px Arial';
-      ctx.fillText('Template demasiado grande para área procesada. Ajustando...', 10, 24);
-      hideVideoOverlay();
-      return requestAnimationFrame(processFrame);
+    if (!resMat || resMat.rows<=0 || resMat.cols<=0){
+      ctx.clearRect(0,0,overlay.width,overlay.height);
+      ctx.fillStyle='white'; ctx.font='14px Arial'; ctx.fillText('Template demasiado grande para área procesada. Ajustando...',10,24);
+      hideVideoOverlay(); requestAnimationFrame(processFrame); return;
     }
 
-    // matchTemplate + minMaxLoc
     cv.matchTemplate(grayMat, templGray, resMat, cv.TM_CCOEFF_NORMED);
     let minVal={value:0}, maxVal={value:0}, minLoc={x:0,y:0}, maxLoc={x:0,y:0};
     cv.minMaxLoc(resMat, minVal, maxVal, minLoc, maxLoc);
     const best = maxVal.value;
 
-    ctx.clearRect(0,0,overlay.width, overlay.height);
-    ctx.fillStyle = 'white';
-    ctx.font = '16px Arial';
-    ctx.fillText('Match: ' + best.toFixed(3), 10, 20);
+    // show big match value
+    bigMatch.textContent = 'Match: ' + best.toFixed(3);
 
-    if (best >= MATCH_THRESHOLD) {
-      const sX = overlay.width / pW;
-      const sY = overlay.height / pH;
+    ctx.clearRect(0,0,overlay.width,overlay.height);
+    ctx.fillStyle='white'; ctx.font='16px Arial'; ctx.fillText('Match: '+best.toFixed(3),10,20);
 
-      const matchX = maxLoc.x + templGray.cols/2;
-      const matchY = maxLoc.y + templGray.rows/2;
-
-      const drawX = matchX * sX;
-      const drawY = matchY * sY;
-      const drawW = templGray.cols * sX;
-      const drawH = templGray.rows * sY;
-
-      ctx.strokeStyle = 'rgba(255,120,200,0.9)';
-      ctx.lineWidth = 4;
-      ctx.strokeRect(maxLoc.x * sX, maxLoc.y * sY, drawW, drawH);
-
+    if (best >= MATCH_THRESHOLD){
+      const sX = overlay.width / pW; const sY = overlay.height / pH;
+      const matchX = maxLoc.x + templGray.cols/2; const matchY = maxLoc.y + templGray.rows/2;
+      const drawX = matchX * sX; const drawY = matchY * sY;
+      const drawW = templGray.cols * sX; const drawH = templGray.rows * sY;
+      ctx.strokeStyle='rgba(255,120,200,0.9)'; ctx.lineWidth=4;
+      ctx.strokeRect(maxLoc.x*sX, maxLoc.y*sY, drawW, drawH);
       showVideoOverlay(drawX, drawY, drawW, drawH);
     } else {
       hideVideoOverlay();
     }
 
-  } catch(err) {
+  } catch(err){
     console.error('Error procesando frame:', err);
   } finally {
     requestAnimationFrame(processFrame);
   }
 }
 
-/* ========== start button ========== */
-startBtn.addEventListener('click', async () => {
-  startBtn.disabled = true;
-  startBtn.style.display = 'none';
-  log('Activando cámara...');
+/* start button */
+startBtn.addEventListener('click', async ()=>{
+  startBtn.disabled=true; startBtn.style.display='none'; log('Activando cámara...');
   await startCamera();
 });
 
-/* ========== limpieza ========== */
-window.addEventListener('pagehide', () => {
-  try {
-    if (srcMat) { srcMat.delete(); srcMat = null; }
-    if (grayMat) { grayMat.delete(); grayMat = null; }
-    if (templMat) { templMat.delete(); templMat = null; }
-    if (templGray) { templGray.delete(); templGray = null; }
-    if (resMat) { resMat.delete(); resMat = null; }
-  } catch(e){}
+/* cleanup */
+window.addEventListener('pagehide', ()=>{
+  try { if (srcMat) srcMat.delete(); if (grayMat) grayMat.delete(); if (templMat) templMat.delete(); if (templGray) templGray.delete(); if (resMat) resMat.delete(); } catch(e){}
   stopCamera();
 });
 </script>
