@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - ORB Matching (skip frames)</title>
+  <title>AR Camiseta - ORB Matching (skip frames) - corregido</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
@@ -188,7 +188,6 @@ async function prepareOpenCV(){
     try {
       orb = new cv.ORB(); // may work on many builds
     } catch(e){
-      // some builds expose ORB differently; try fallback attempt
       try { orb = new cv.ORB(); } catch(err){ console.warn("ORB not available in this build:", err); }
     }
     bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
@@ -232,7 +231,7 @@ async function prepareOpenCV(){
   img.onerror = e => { alert("No se pudo cargar " + TARGET_URL); console.error(e); };
 }
 
-/* ========== processFrame (ORB + FRAME_SKIP) ========== */
+/* ========== processFrame (ORB + FRAME_SKIP) - CORREGIDO para DMatch sin .delete() ========== */
 function processFrame(now){
   if (!streaming) return;
 
@@ -316,30 +315,33 @@ function processFrame(now){
       catch(err){ console.error('BFMatcher.knnMatch failed', err); matches.delete(); frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; }
     }
 
-    // ratio test
+    // === ratio test (seguro para builds donde DMatch no tiene .delete()) ===
+    // goodMatches will be plain JS objects: { queryIdx, trainIdx, distance }
     let goodMatches = [];
-    for (let i=0; i < matches.size(); i++){
+    for (let i = 0; i < matches.size(); i++) {
       const mv = matches.get(i);
-      if (mv.size() >= 2){
+      if (mv.size() >= 2) {
         const m = mv.get(0);
         const n = mv.get(1);
-        if (m.distance <= MATCH_RATIO * n.distance){
-          goodMatches.push(m);
-        } else {
-          m.delete();
+        if (m.distance <= MATCH_RATIO * n.distance) {
+          goodMatches.push({ queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance });
         }
-        n.delete();
-      } else if (mv.size() === 1){
+        // do NOT call m.delete() or n.delete() — not safe in this build
+      } else if (mv.size() === 1) {
         const m = mv.get(0);
-        if (m.distance < 30) goodMatches.push(m); else m.delete();
+        if (m.distance < 30) {
+          goodMatches.push({ queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance });
+        }
       }
+      // delete the DMatchVector (mv) which does have delete()
       mv.delete();
     }
+    // delete top-level matches container
     matches.delete();
 
     // insufficient matches?
     if (goodMatches.length < minMatchCount){
-      for (let gm of goodMatches) try{ gm.delete(); } catch(e){}
+      // no DMatch objects to delete (we stored plain JS objects), just cleanup cv objects
       frameKeypoints.delete(); frameDescriptors.delete();
       ctx.clearRect(0,0,overlay.width, overlay.height);
       ctx.fillStyle='white'; ctx.font='16px Arial';
@@ -350,17 +352,18 @@ function processFrame(now){
       return;
     }
 
-    // build point arrays for homography
+    // build point arrays for homography using plain objects
     const srcPts = [];
     const dstPts = [];
     for (let i=0; i<goodMatches.length; i++){
-      const m = goodMatches[i];
-      const queryIdx = m.queryIdx; // index in frame
-      const trainIdx = m.trainIdx; // index in template
+      const gm = goodMatches[i];
+      const queryIdx = gm.queryIdx; // index in frame
+      const trainIdx = gm.trainIdx; // index in template
       const kpFrame = frameKeypoints.get(queryIdx);
       const kpTpl = templKeypoints.get(trainIdx);
       srcPts.push(kpFrame.pt.x, kpFrame.pt.y);
       dstPts.push(kpTpl.pt.x, kpTpl.pt.y);
+      // do NOT delete kpFrame/kpTpl here
     }
 
     let srcMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPts);
@@ -427,7 +430,8 @@ function processFrame(now){
     // cleanup
     srcMatPts.delete(); dstMatPts.delete(); mask.delete();
     if (H && !H.isDeleted) H.delete();
-    for (let gm of goodMatches) try{ gm.delete(); } catch(e){}
+
+    // delete frame keypoints/descriptors
     frameKeypoints.delete(); frameDescriptors.delete();
 
   } catch(err){
