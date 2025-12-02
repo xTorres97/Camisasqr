@@ -1,20 +1,21 @@
 <!doctype html>
-<html>
+<html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Optimizado (ORB, menos lag)</title>
+  <title>AR Camiseta - Optical Flow (Optimizado)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
     video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
-    /* contenedor overlay transparente */
     #overlayContainer{
       position:fixed; left:0; top:0;
       pointer-events:none; z-index:9999;
       display:none; transform-origin:center center;
       background:transparent;
+      will-change: transform, opacity;
+      -webkit-transform: translate3d(0,0,0);
     }
     #overlayContainer > video { display:block; width:100%; height:100%; background:transparent; }
     #controls{position:fixed; right:12px; top:60px; z-index:10000; display:flex; flex-direction:column; gap:8px}
@@ -22,8 +23,7 @@
     #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:40}
     #note{position:fixed;left:0;right:0;bottom:10px;text-align:center;z-index:40;opacity:0.9}
     #log{position:fixed;left:8px;top:8px;background:rgba(0,0,0,0.6);padding:6px 8px;border-radius:6px;font-size:12px;z-index:40}
-    #bigMatch{position:fixed;left:8px;top:48px;font-size:20px;font-weight:700;color:#fff;text-shadow:0 0 6px #000;z-index:40}
-    /* boton para forzar reproducir (si autoplay falla) */
+    #bigMatch{position:fixed;left:8px;top:48px;font-size:18px;font-weight:700;color:#fff;text-shadow:0 0 6px #000;z-index:40}
     #forcePlay{position:fixed;left:50%;top:70%;transform:translate(-50%,-50%);z-index:10001;padding:12px 18px;background:#ff4fa8;color:#fff;border-radius:8px;border:none;display:none}
   </style>
 </head>
@@ -52,12 +52,14 @@
 <script>
 /* ---------- CONFIG (AJUSTABLE) ---------- */
 const TARGET_URL = './ilustracion.png';
-let RES_SCALE = 0.5;        // <<--- reducir para mejorar velocidad
-let FRAME_SKIP = 3;         // procesar 1 cada N frames
+let RES_SCALE = 0.25;        // <<--- reducir para mejorar velocidad
+let FRAME_SKIP = 3;          // procesar 1 cada N frames (OR detección completa)
 let MATCH_RATIO = 0.75;
-let minMatchCount = 5;
-const MAX_GOOD_MATCHES = 300; // truncar para no procesar millones
+let minMatchCount = 6;
+const MAX_GOOD_MATCHES = 100; // cap para matches
 const MAX_TEMPL_SIZE = 512;   // reducir template grande al cargar
+const MIN_TRACK_POINTS = 6;   // puntos mínimos para confiar en optical flow
+const REDETECT_AFTER_SECONDS = 2.5; // tiempo tras el cual forzamos nueva detección parcial
 /* ---------------------------------------- */
 
 const cam = document.getElementById('cam');
@@ -76,6 +78,15 @@ let srcMat=null, grayMat=null, templMat=null, templGray=null;
 let procCanvas=null, procCtx=null;
 let orb=null, bf=null, templKeypoints=null, templDescriptors=null;
 let frameCounter = 0;
+let detectionLockedUntil = 0;
+
+// TRACKING state (optical flow)
+let trackingActive = false;
+let prevGray = null;
+let prevPts = null;        // CV_32FC2 Nx1 (puntos en frame)
+let templPts = null;       // CV_32FC2 Nx1 (puntos correspondientes en template)
+let lastValidHomography = null;
+let lastTrackTime = 0;
 
 function log(s){ logEl.textContent = s; console.log(s); }
 
@@ -102,10 +113,8 @@ function showOverlayCentered(cx, cy, w, h, angleDeg = 0){
   overlayContainer.style.height = Math.max(10, h) + 'px';
   overlayContainer.style.display = 'block';
   overlayContainer.style.visibility = 'visible';
-  overlayContainer.style.transform = `translate(-50%,-50%) rotate(${angleDeg}deg)`;
-  // ensure video fills container but preserves alpha and aspect
+  overlayContainer.style.transform = `translate(-50%,-50%) rotate(${angleDeg}deg) translate3d(0,0,0)`;
   fx.style.width = '100%'; fx.style.height = '100%'; fx.style.objectFit = 'cover';
-  // try play (autoplay may fail)
   fx.play().then(()=>{ log('video play ok'); forcePlay.style.display='none'; }).catch(err=>{ log('Autoplay error: '+err); forcePlay.style.display='block'; });
 }
 function hideOverlay(){ const fx = document.getElementById('fxVideo'); if (fx) try{ fx.pause(); }catch(e){} overlayContainer.style.display='none'; overlayContainer.style.visibility='hidden'; }
@@ -152,7 +161,6 @@ async function prepareOpenCV(){
     // draw template to temp canvas, and downscale if very large
     const tmp = document.createElement('canvas');
     let tw = img.width, th = img.height;
-    // if too big, calculate scale
     if (Math.max(tw,th) > MAX_TEMPL_SIZE){
       const s = MAX_TEMPL_SIZE / Math.max(tw,th);
       tw = Math.round(tw * s); th = Math.round(th * s);
@@ -162,10 +170,10 @@ async function prepareOpenCV(){
     tctx.drawImage(img, 0, 0, tw, th);
 
     // cleanup previous
-    if (templKeypoints){ try{ templKeypoints.delete(); }catch(e){} }
-    if (templDescriptors){ try{ templDescriptors.delete(); }catch(e){} }
-    if (templMat){ templMat.delete(); templMat = null; }
-    if (templGray){ templGray.delete(); templGray = null; }
+    try{ if (templKeypoints){ templKeypoints.delete(); templKeypoints = null; } }catch(e){}
+    try{ if (templDescriptors){ templDescriptors.delete(); templDescriptors = null; } }catch(e){}
+    try{ if (templMat){ templMat.delete(); templMat = null; } }catch(e){}
+    try{ if (templGray){ templGray.delete(); templGray = null; } }catch(e){}
 
     templMat = cv.imread(tmp);
     templGray = new cv.Mat();
@@ -196,20 +204,36 @@ async function prepareOpenCV(){
     srcMat = new cv.Mat(procH, procW, cv.CV_8UC4);
     grayMat = new cv.Mat(procH, procW, cv.CV_8UC1);
 
-    requestAnimationFrame(processFrame);
+    // start loop
+    scheduleNextFrame();
   };
 
   img.onerror = (e) => { alert('No se pudo cargar ' + TARGET_URL); console.error(e); };
 }
 
-/* main loop (ORB, frame skip, limited matches) */
+/* schedule frame callback (video-synced si posible) */
+function scheduleNextFrame(){
+  if (!streaming) return;
+  if (cam.requestVideoFrameCallback){
+    cam.requestVideoFrameCallback(()=>processFrame(performance.now()));
+  } else {
+    requestAnimationFrame(processFrame);
+  }
+}
+
+/* convert KeyPoint to point array (frame coords) */
+function keypointToXY(kp){ return {x: kp.pt.x, y: kp.pt.y}; }
+
+/* main loop: si trackingActive -> optical flow; si no -> ORB detection */
 function processFrame(now){
   if (!streaming) return;
   try {
     frameCounter = (frameCounter + 1) % FRAME_SKIP;
+
     const pW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
     const pH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
 
+    // ensure procCanvas matches size
     if (!procCanvas || procCanvas.width !== pW || procCanvas.height !== pH){
       if (srcMat) { srcMat.delete(); srcMat = null; }
       if (grayMat) { grayMat.delete(); grayMat = null; }
@@ -227,38 +251,186 @@ function processFrame(now){
     if (srcMat && srcMat.data && srcMat.data.length === imageData.data.length){
       srcMat.data.set(imageData.data);
     } else {
+      if (srcMat) try{ srcMat.delete(); }catch(e){}
       srcMat = cv.imread(procCanvas);
     }
-
-    if (frameCounter !== 0){ requestAnimationFrame(processFrame); return; }
-
     cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
 
+    // Si tracking activo: intentar optical flow
+    if (trackingActive){
+      // tiempo desde último track válido — si pasa mucho, forzamos re-detección
+      if (performance.now() - lastTrackTime > REDETECT_AFTER_SECONDS * 1000){
+        trackingActive = false;
+        log('Forzando re-detección por tiempo'); 
+      } else {
+        // calcOpticalFlowPyrLK
+        try {
+          let nextPts = new cv.Mat();
+          let status = new cv.Mat();
+          let err = new cv.Mat();
+          // prevPts y prevGray existen y están en resolución pW x pH
+          cv.calcOpticalFlowPyrLK(prevGray, grayMat, prevPts, nextPts, status, err, new cv.Size(21,21), 3);
+          
+          // filtrar buenos puntos y mapear con templPts
+          const goodPrev = [];
+          const goodNext = [];
+          const goodTempl = [];
+          for (let i=0;i<status.rows;i++){
+            if (status.ucharPtr(i,0)[0] === 1){
+              // nextPts is CV_32FC2: floatAt(row,0) gives x then y? Use data directly
+              const nx = nextPts.floatAt(i,0);
+              const ny = nextPts.floatAt(i,1);
+              const tx = templPts.floatAt(i,0);
+              const ty = templPts.floatAt(i,1);
+              // sanity check: coordinates valid
+              if (!isFinite(nx) || !isFinite(ny)) continue;
+              goodNext.push(nx, ny);
+              goodTempl.push(tx, ty);
+            }
+          }
+
+          // cleanup mats we won't reuse
+          nextPts.delete(); status.delete(); err.delete();
+
+          if (goodNext.length / 2 < MIN_TRACK_POINTS){
+            // tracking lost -> volver a detección completa
+            trackingActive = false;
+            log('Tracking falló (pocos puntos). Volviendo a detección completa.');
+            // limpiar prev mats
+            try{ if (prevPts){ prevPts.delete(); prevPts = null; } }catch(e){}
+            try{ if (prevGray){ prevGray.delete(); prevGray = null; } }catch(e){}
+          } else {
+            // construir mats para findHomography: src=framePoints(next), dst=templPoints
+            const n = goodNext.length/2;
+            const nextMat = cv.matFromArray(n, 1, cv.CV_32FC2, goodNext);
+            const templSubMat = cv.matFromArray(n, 1, cv.CV_32FC2, goodTempl);
+            let mask = new cv.Mat();
+            let H = cv.findHomography(nextMat, templSubMat, cv.RANSAC, 5.0, mask);
+
+            // Calcular inliers count
+            let inliers = 0;
+            for (let i=0;i<mask.rows;i++) if (mask.ucharPtr(i,0)[0]) inliers++;
+
+            ctx.clearRect(0,0,overlay.width, overlay.height);
+            ctx.fillStyle='white'; ctx.font='14px Arial';
+            ctx.fillText('Tracking points: ' + n + ' inliers:' + inliers,10,20);
+            bigMatch.textContent = 'Track pts:' + n + ' | Inliers:' + inliers;
+
+            if (!H.empty() && inliers >= Math.max(4, Math.floor(n * 0.25))){
+              // invert H para mappear template->frame (igual que antes)
+              let H_inv = new cv.Mat(); cv.invert(H, H_inv, cv.DECOMP_LU);
+              const tw = templGray.cols, th = templGray.rows;
+              const tplCorners = cv.matFromArray(4,1,cv.CV_32FC2, [0,0, tw,0, tw,th, 0,th]);
+              let dstCorners = new cv.Mat();
+              cv.perspectiveTransform(tplCorners, dstCorners, H_inv);
+
+              const scaleX = overlay.width / srcMat.cols;
+              const scaleY = overlay.height / srcMat.rows;
+
+              const x0 = dstCorners.floatAt(0,0), y0 = dstCorners.floatAt(0,1);
+              const x1 = dstCorners.floatAt(1,0), y1 = dstCorners.floatAt(1,1);
+              const x2 = dstCorners.floatAt(2,0), y2 = dstCorners.floatAt(2,1);
+              const x3 = dstCorners.floatAt(3,0), y3 = dstCorners.floatAt(3,1);
+
+              const minX = Math.min(x0,x1,x2,x3), maxX = Math.max(x0,x1,x2,x3);
+              const minY = Math.min(y0,y1,y2,y3), maxY = Math.max(y0,y1,y2,y3);
+              const centerX = (minX+maxX)/2, centerY=(minY+maxY)/2;
+              const drawW = (maxX-minX)*scaleX, drawH = (maxY-minY)*scaleY;
+              const drawCX = centerX*scaleX, drawCY = centerY*scaleY;
+              const angleRad = Math.atan2(y1-y0, x1-x0); const angleDeg = angleRad*180/Math.PI;
+
+              // debug polygon
+              ctx.strokeStyle='rgba(0,255,150,0.95)'; ctx.lineWidth=3;
+              ctx.beginPath();
+              ctx.moveTo(x0*scaleX, y0*scaleY);
+              ctx.lineTo(x1*scaleX, y1*scaleY);
+              ctx.lineTo(x2*scaleX, y2*scaleY);
+              ctx.lineTo(x3*scaleX, y3*scaleY);
+              ctx.closePath(); ctx.stroke();
+
+              showOverlayCentered(drawCX, drawCY, drawW, drawH, angleDeg);
+              lastValidHomography && (lastValidHomography.delete(), lastValidHomography = null);
+              lastValidHomography = H.clone();
+              H_inv.delete(); tplCorners.delete(); dstCorners.delete();
+            } else {
+              hideOverlay();
+            }
+
+            // preparar siguiente iteración: prevGray = grayMat.clone(); prevPts = nextMat filtered by mask
+            // crear filtered next pts by mask
+            const goodNextFiltered = [];
+            const goodTemplFiltered = [];
+            for (let i=0;i<mask.rows;i++){
+              if (mask.ucharPtr(i,0)[0]){
+                goodNextFiltered.push(goodNext[2*i], goodNext[2*i+1]);
+                goodTemplFiltered.push(goodTempl[2*i], goodTempl[2*i+1]);
+              }
+            }
+            // liberar mats antiguos
+            try{ if (prevPts){ prevPts.delete(); prevPts = null; } }catch(e){}
+            try{ if (prevGray){ prevGray.delete(); prevGray = null; } }catch(e){}
+
+            prevPts = cv.matFromArray(goodNextFiltered.length/2, 1, cv.CV_32FC2, goodNextFiltered);
+            // IMPORTANT: templPts must always correspond in index order with prevPts
+            templPts.delete(); templPts = cv.matFromArray(goodTemplFiltered.length/2, 1, cv.CV_32FC2, goodTemplFiltered);
+
+            prevGray = grayMat.clone();
+            lastTrackTime = performance.now();
+
+            // cleanup temporales
+            nextMat.delete(); templSubMat.delete(); mask.delete();
+            // H is cloned earlier if used; delete original
+            if (H && !H.isDeleted) H.delete();
+          }
+
+        } catch(err){
+          console.error('Optical flow error', err);
+          // en caso de error, caer a detección completa
+          trackingActive = false;
+        }
+
+        // schedule next
+        scheduleNextFrame();
+        return;
+      }
+    } // end if trackingActive
+
+    // si no estamos en tracking: ejecutar detección cada FRAME_SKIP frames
+    if (frameCounter !== 0){
+      // solamente dibujar status
+      ctx.clearRect(0,0,overlay.width, overlay.height);
+      ctx.fillStyle='white'; ctx.font='14px Arial';
+      ctx.fillText('Esperando detección... (frameskip: '+FRAME_SKIP+')',10,20);
+      scheduleNextFrame();
+      return;
+    }
+
+    // ORB detection + matching (similar a tu flujo original)
     let frameKeypoints = new cv.KeyPointVector();
     let frameDescriptors = new cv.Mat();
     try {
       orb.detect(grayMat, frameKeypoints);
       orb.compute(grayMat, frameKeypoints, frameDescriptors);
     } catch(e){
-      try { orb.detectAndCompute(grayMat, new cv.Mat(), frameKeypoints, frameDescriptors); } catch(err){ console.error('ORB frame err', err); frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; }
+      try { orb.detectAndCompute(grayMat, new cv.Mat(), frameKeypoints, frameDescriptors); } catch(err){ console.error('ORB frame err', err); frameKeypoints.delete(); frameDescriptors.delete(); scheduleNextFrame(); return; }
     }
 
     const tplK = templKeypoints ? templKeypoints.size() : 0;
     const frmK = frameKeypoints ? frameKeypoints.size() : 0;
     if (!tplK || !frmK){
       ctx.clearRect(0,0,overlay.width, overlay.height);
-      ctx.fillStyle='white'; ctx.font='16px Arial';
+      ctx.fillStyle='white'; ctx.font='14px Arial';
       ctx.fillText('Match: -- (kp tpl:'+tplK+' frm:'+frmK+')',10,20);
       frameKeypoints.delete(); frameDescriptors.delete();
       hideOverlay();
-      requestAnimationFrame(processFrame);
+      scheduleNextFrame();
       return;
     }
 
     // knn match
     let matches = new cv.DMatchVectorVector();
     try { bf.knnMatch(frameDescriptors, templDescriptors, matches, 2); }
-    catch(e){ console.error('knnMatch err', e); matches.delete(); frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; }
+    catch(e){ console.error('knnMatch err', e); matches.delete(); frameKeypoints.delete(); frameDescriptors.delete(); scheduleNextFrame(); return; }
 
     // ratio test -> plain JS objects
     let goodMatches = [];
@@ -274,7 +446,6 @@ function processFrame(now){
         if (m.distance < 30) goodMatches.push({queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance});
       }
       mv.delete();
-      // safety cap: if too many matches, stop adding
       if (goodMatches.length >= MAX_GOOD_MATCHES) break;
     }
     matches.delete();
@@ -282,26 +453,27 @@ function processFrame(now){
     if (goodMatches.length < minMatchCount){
       frameKeypoints.delete(); frameDescriptors.delete();
       ctx.clearRect(0,0,overlay.width, overlay.height);
-      ctx.fillStyle='white'; ctx.font='16px Arial';
+      ctx.fillStyle='white'; ctx.font='14px Arial';
       ctx.fillText('Matches: ' + goodMatches.length + ' (need '+minMatchCount+')',10,20);
       bigMatch.textContent = 'Matches: ' + goodMatches.length;
       hideOverlay();
-      requestAnimationFrame(processFrame);
+      scheduleNextFrame();
       return;
     }
 
-    // build points for homography (plain arrays)
-    const srcPts = []; const dstPts = [];
-    for (let i=0; i<goodMatches.length; i++){
+    // build points for homography: framePts (src) and templPts (dst)
+    const srcPtsArr = []; const dstPtsArr = [];
+    for (let i=0;i<goodMatches.length;i++){
       const gm = goodMatches[i];
       const q = gm.queryIdx, t = gm.trainIdx;
       const kpf = frameKeypoints.get(q);
       const kpt = templKeypoints.get(t);
-      srcPts.push(kpf.pt.x, kpf.pt.y); dstPts.push(kpt.pt.x, kpt.pt.y);
+      srcPtsArr.push(kpf.pt.x, kpf.pt.y); // frame coordinates (proc scale)
+      dstPtsArr.push(kpt.pt.x, kpt.pt.y); // templ coordinates (templ scale)
     }
 
-    let srcMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPts);
-    let dstMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPts);
+    let srcMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPtsArr);
+    let dstMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPtsArr);
     let mask = new cv.Mat();
     let H = cv.findHomography(srcMatPts, dstMatPts, cv.RANSAC, 5.0, mask);
 
@@ -309,11 +481,34 @@ function processFrame(now){
     for (let i=0;i<mask.rows;i++) if (mask.ucharPtr(i,0)[0]) inliers++;
 
     ctx.clearRect(0,0,overlay.width, overlay.height);
-    ctx.fillStyle='white'; ctx.font='16px Arial';
+    ctx.fillStyle='white'; ctx.font='14px Arial';
     ctx.fillText('Matches: ' + goodMatches.length + ' inliers:' + inliers,10,20);
     bigMatch.textContent = 'Matches: ' + goodMatches.length + ' | Inliers: ' + inliers;
 
     if (!H.empty() && inliers >= Math.max(4, Math.floor(goodMatches.length * 0.2))){
+      // Successful detection -> setup tracking arrays for optical flow
+      // build filtered arrays (only inliers)
+      const goodFramePts = [];
+      const goodTemplPts = [];
+      for (let i=0;i<mask.rows;i++){
+        if (mask.ucharPtr(i,0)[0]){
+          goodFramePts.push(srcPtsArr[2*i], srcPtsArr[2*i+1]);
+          goodTemplPts.push(dstPtsArr[2*i], dstPtsArr[2*i+1]);
+        }
+      }
+
+      // set up prevGray, prevPts, templPts for optical flow
+      try{ if (prevGray){ prevGray.delete(); prevGray = null; } }catch(e){}
+      try{ if (prevPts){ prevPts.delete(); prevPts = null; } }catch(e){}
+      try{ if (templPts){ templPts.delete(); templPts = null; } }catch(e){}
+
+      prevPts = cv.matFromArray(goodFramePts.length/2, 1, cv.CV_32FC2, goodFramePts);
+      templPts = cv.matFromArray(goodTemplPts.length/2, 1, cv.CV_32FC2, goodTemplPts);
+      prevGray = grayMat.clone();
+      trackingActive = true;
+      lastTrackTime = performance.now();
+
+      // compute and show overlay once now (same as before)
       let H_inv = new cv.Mat(); cv.invert(H, H_inv, cv.DECOMP_LU);
       const tw = templGray.cols, th = templGray.rows;
       const tplCorners = cv.matFromArray(4,1,cv.CV_32FC2, [0,0, tw,0, tw,th, 0,th]);
@@ -333,11 +528,9 @@ function processFrame(now){
       const centerX = (minX+maxX)/2, centerY=(minY+maxY)/2;
       const drawW = (maxX-minX)*scaleX, drawH = (maxY-minY)*scaleY;
       const drawCX = centerX*scaleX, drawCY = centerY*scaleY;
-
       const angleRad = Math.atan2(y1-y0, x1-x0); const angleDeg = angleRad*180/Math.PI;
 
-      // debug polygon
-      ctx.strokeStyle='rgba(0,255,150,0.95)'; ctx.lineWidth=4;
+      ctx.strokeStyle='rgba(0,255,150,0.95)'; ctx.lineWidth=3;
       ctx.beginPath();
       ctx.moveTo(x0*scaleX, y0*scaleY);
       ctx.lineTo(x1*scaleX, y1*scaleY);
@@ -345,15 +538,15 @@ function processFrame(now){
       ctx.lineTo(x3*scaleX, y3*scaleY);
       ctx.closePath(); ctx.stroke();
 
-      // **show overlay** (video with alpha preferred)
       showOverlayCentered(drawCX, drawCY, drawW, drawH, angleDeg);
 
+      // cleanup
       tplCorners.delete(); dstCorners.delete(); H_inv.delete();
     } else {
       hideOverlay();
     }
 
-    // cleanup
+    // cleanup detection mats
     srcMatPts.delete(); dstMatPts.delete(); mask.delete();
     if (H && !H.isDeleted) H.delete();
     frameKeypoints.delete(); frameDescriptors.delete();
@@ -361,7 +554,7 @@ function processFrame(now){
   } catch(err){
     console.error('Error procesando frame:', err);
   } finally {
-    requestAnimationFrame(processFrame);
+    scheduleNextFrame();
   }
 }
 
@@ -381,6 +574,10 @@ window.addEventListener('pagehide', ()=>{
     if (templGray) { templGray.delete(); templGray = null; }
     if (templKeypoints) { templKeypoints.delete(); templKeypoints = null; }
     if (templDescriptors) { templDescriptors.delete(); templDescriptors = null; }
+    if (prevPts) { prevPts.delete(); prevPts = null; }
+    if (prevGray) { prevGray.delete(); prevGray = null; }
+    if (templPts) { templPts.delete(); templPts = null; }
+    if (lastValidHomography){ lastValidHomography.delete(); lastValidHomography = null; }
   } catch(e){}
   stopCamera();
 });
