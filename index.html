@@ -2,29 +2,29 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Ilustración + Animación</title>
+  <title>AR Camiseta - Optimizado (ORB, menos lag)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
     video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
-    /* contenedor para el overlay (video/webm con alpha) */
+    /* contenedor overlay transparente */
     #overlayContainer{
-      position:fixed;
-      left:0; top:0;
-      pointer-events:none;
-      z-index:9999;
-      display:none;
-      transform-origin:center center;
+      position:fixed; left:0; top:0;
+      pointer-events:none; z-index:9999;
+      display:none; transform-origin:center center;
+      background:transparent;
     }
-    #overlayContainer > video, #overlayContainer > svg { display:block; width:100%; height:100%; }
+    #overlayContainer > video { display:block; width:100%; height:100%; background:transparent; }
     #controls{position:fixed; right:12px; top:60px; z-index:10000; display:flex; flex-direction:column; gap:8px}
     .ctrlBtn{padding:10px 12px;border-radius:8px;border:none;background:#ff4fa8;color:#fff;font-weight:600}
     #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:40}
     #note{position:fixed;left:0;right:0;bottom:10px;text-align:center;z-index:40;opacity:0.9}
     #log{position:fixed;left:8px;top:8px;background:rgba(0,0,0,0.6);padding:6px 8px;border-radius:6px;font-size:12px;z-index:40}
     #bigMatch{position:fixed;left:8px;top:48px;font-size:20px;font-weight:700;color:#fff;text-shadow:0 0 6px #000;z-index:40}
+    /* boton para forzar reproducir (si autoplay falla) */
+    #forcePlay{position:fixed;left:50%;top:70%;transform:translate(-50%,-50%);z-index:10001;padding:12px 18px;background:#ff4fa8;color:#fff;border-radius:8px;border:none;display:none}
   </style>
 </head>
 <body>
@@ -33,8 +33,7 @@
     <canvas id="overlay"></canvas>
   </div>
 
-  <!-- Contenedor donde inyectamos el webm (transparente si webm tiene alpha) -->
-  <div id="overlayContainer"><!-- contenido se inyecta dinámicamente --></div>
+  <div id="overlayContainer"></div>
 
   <div id="controls">
     <button id="testShow" class="ctrlBtn">Mostrar animación de prueba</button>
@@ -42,6 +41,8 @@
   </div>
 
   <button id="startBtn">Activar AR</button>
+  <button id="forcePlay">Toca para reproducir animación</button>
+
   <div id="note">Apunta la cámara hacia la imagen de la camiseta</div>
   <div id="log">listo</div>
   <div id="bigMatch">Match: --</div>
@@ -49,14 +50,16 @@
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 
 <script>
-/* CONFIG */
-const TARGET_URL = './ilustracion.png';   // tu imagen marker
-let RES_SCALE = 0.7;
-let FRAME_SKIP = 2;
+/* ---------- CONFIG (AJUSTABLE) ---------- */
+const TARGET_URL = './ilustracion.png';
+let RES_SCALE = 0.5;        // <<--- reducir para mejorar velocidad
+let FRAME_SKIP = 3;         // procesar 1 cada N frames
 let MATCH_RATIO = 0.75;
-let minMatchCount = 6;
+let minMatchCount = 5;
+const MAX_GOOD_MATCHES = 300; // truncar para no procesar millones
+const MAX_TEMPL_SIZE = 512;   // reducir template grande al cargar
+/* ---------------------------------------- */
 
-/* DOM */
 const cam = document.getElementById('cam');
 const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
@@ -66,25 +69,29 @@ const bigMatch = document.getElementById('bigMatch');
 const overlayContainer = document.getElementById('overlayContainer');
 const testShow = document.getElementById('testShow');
 const testHide = document.getElementById('testHide');
+const forcePlay = document.getElementById('forcePlay');
+
+let videoStream = null, streaming = false;
+let srcMat=null, grayMat=null, templMat=null, templGray=null;
+let procCanvas=null, procCtx=null;
+let orb=null, bf=null, templKeypoints=null, templDescriptors=null;
+let frameCounter = 0;
 
 function log(s){ logEl.textContent = s; console.log(s); }
 
-/* video overlay markup (we insert this when needed) */
+/* overlay video markup */
 const overlayVideoMarkup = (filename) => `
-  <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="will-change:transform; display:block;">
+  <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="background:transparent;display:block;">
     <source src="${filename}" type="video/webm">
-    <!-- fallback: if webm not supported, try mp4 -->
     <source src="${filename.replace('.webm','.mp4')}" type="video/mp4">
   </video>`;
 
-/* helper show/hide the overlay video centered & rotated */
+/* show overlay centered (cx,cy center in overlay canvas coords) */
 function showOverlayCentered(cx, cy, w, h, angleDeg = 0){
-  // cx,cy in overlay canvas pixels (center)
   const rect = overlay.getBoundingClientRect();
   const screenX = rect.left + cx + window.scrollX;
   const screenY = rect.top + cy + window.scrollY;
 
-  // make sure video element exists
   if (!document.getElementById('fxVideo')){
     overlayContainer.innerHTML = overlayVideoMarkup('./Animacion.webm');
   }
@@ -96,27 +103,21 @@ function showOverlayCentered(cx, cy, w, h, angleDeg = 0){
   overlayContainer.style.display = 'block';
   overlayContainer.style.visibility = 'visible';
   overlayContainer.style.transform = `translate(-50%,-50%) rotate(${angleDeg}deg)`;
-  // style video to fill container
+  // ensure video fills container but preserves alpha and aspect
   fx.style.width = '100%'; fx.style.height = '100%'; fx.style.objectFit = 'cover';
-
-  // play (autoplay might be blocked; catch)
-  fx.play().catch(e => { log('Autoplay error: ' + e); /* user must tap to allow */ });
+  // try play (autoplay may fail)
+  fx.play().then(()=>{ log('video play ok'); forcePlay.style.display='none'; }).catch(err=>{ log('Autoplay error: '+err); forcePlay.style.display='block'; });
 }
-function hideOverlay(){
-  const fx = document.getElementById('fxVideo');
-  if (fx) try{ fx.pause(); } catch(e){}
-  overlayContainer.style.display = 'none';
-}
+function hideOverlay(){ const fx = document.getElementById('fxVideo'); if (fx) try{ fx.pause(); }catch(e){} overlayContainer.style.display='none'; overlayContainer.style.visibility='hidden'; }
 
-/* rest of ORB/OpenCV code is same pattern as antes (prepareOpenCV, processFrame) */
-/* For brevity I keep same logic as last working index but adapted to use overlay functions above. */
+/* forcePlay helper */
+forcePlay.addEventListener('click', ()=>{ const fx = document.getElementById('fxVideo'); if (fx) { fx.play().catch(()=>{}); forcePlay.style.display='none'; } });
 
-let videoStream = null, streaming = false;
-let srcMat=null, grayMat=null, templMat=null, templGray=null;
-let procCanvas=null, procCtx=null;
-let orb=null, bf=null, templKeypoints=null, templDescriptors=null;
-let frameCounter = 0;
+/* test buttons */
+testShow.addEventListener('click', ()=>{ const r = overlay.getBoundingClientRect(); showOverlayCentered(r.width/2, r.height/2, r.width*0.5, r.height*0.5, 0); });
+testHide.addEventListener('click', ()=>{ hideOverlay(); });
 
+/* camera start/stop */
 async function startCamera(){
   try {
     videoStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
@@ -125,139 +126,264 @@ async function startCamera(){
     streaming = true;
     resizeCanvas();
     prepareOpenCV();
-  } catch(e){ alert('Error cámara: ' + e.message); console.error(e); }
+  } catch(e){
+    alert('Error al abrir la cámara: ' + e.message);
+    console.error(e);
+  }
 }
 function stopCamera(){ if (videoStream) videoStream.getTracks().forEach(t=>t.stop()); streaming=false; }
 function resizeCanvas(){ overlay.width = cam.videoWidth; overlay.height = cam.videoHeight; overlay.style.width = cam.clientWidth + 'px'; overlay.style.height = cam.clientHeight + 'px'; }
 
+/* prepareOpenCV with template resize (faster) */
 async function prepareOpenCV(){
-  log('Esperando OpenCV...');
+  log("Esperando OpenCV...");
   if (typeof cv === 'undefined' || !cv.imread){
     let waited=0;
     while((typeof cv === 'undefined' || !cv.imread) && waited<5000){ await new Promise(r=>setTimeout(r,100)); waited+=100; }
   }
   if (typeof cv === 'undefined' || !cv.imread){ alert('OpenCV no cargó'); return; }
 
-  log('OpenCV listo — cargando marker...');
+  log('OpenCV listo — cargando template...');
   const img = new Image();
   img.crossOrigin = 'anonymous';
   img.src = TARGET_URL + '?v=' + Date.now();
+
   img.onload = () => {
+    // draw template to temp canvas, and downscale if very large
     const tmp = document.createElement('canvas');
-    tmp.width = img.width; tmp.height = img.height;
-    tmp.getContext('2d').drawImage(img,0,0);
-    if (templMat) templMat.delete(); if (templGray) templGray.delete();
+    let tw = img.width, th = img.height;
+    // if too big, calculate scale
+    if (Math.max(tw,th) > MAX_TEMPL_SIZE){
+      const s = MAX_TEMPL_SIZE / Math.max(tw,th);
+      tw = Math.round(tw * s); th = Math.round(th * s);
+    }
+    tmp.width = tw; tmp.height = th;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(img, 0, 0, tw, th);
+
+    // cleanup previous
+    if (templKeypoints){ try{ templKeypoints.delete(); }catch(e){} }
+    if (templDescriptors){ try{ templDescriptors.delete(); }catch(e){} }
+    if (templMat){ templMat.delete(); templMat = null; }
+    if (templGray){ templGray.delete(); templGray = null; }
+
     templMat = cv.imread(tmp);
     templGray = new cv.Mat();
     cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
+
     // init ORB & BFMatcher
-    try { orb = new cv.ORB(); } catch(e){ console.warn('ORB init err', e); }
+    try { orb = new cv.ORB(); } catch(e){ console.warn('ORB init error', e); }
     bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+
     templKeypoints = new cv.KeyPointVector();
     templDescriptors = new cv.Mat();
-    try { orb.detect(templGray, templKeypoints); orb.compute(templGray, templKeypoints, templDescriptors); }
-    catch(e){ try { orb.detectAndCompute(templGray, new cv.Mat(), templKeypoints, templDescriptors); } catch(err){ alert('ORB error en template'); return; } }
-    log('Template KP: ' + templKeypoints.size());
+    try {
+      orb.detect(templGray, templKeypoints);
+      orb.compute(templGray, templKeypoints, templDescriptors);
+    } catch(e){
+      try { orb.detectAndCompute(templGray, new cv.Mat(), templKeypoints, templDescriptors); } catch(err){ alert('ORB detect/compute falló en template'); console.error(err); return; }
+    }
+
+    log('Template loaded. KP:'+templKeypoints.size() + ' desc rows:' + templDescriptors.rows);
+
+    /* prepare processing mats at scaled resolution */
     const procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
     const procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
     procCanvas = document.createElement('canvas'); procCanvas.width = procW; procCanvas.height = procH;
-    procCtx = procCanvas.getContext('2d', { willReadFrequently:true });
+    procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+
     if (srcMat) srcMat.delete(); if (grayMat) grayMat.delete();
     srcMat = new cv.Mat(procH, procW, cv.CV_8UC4);
     grayMat = new cv.Mat(procH, procW, cv.CV_8UC1);
+
     requestAnimationFrame(processFrame);
   };
-  img.onerror = e => { alert('No se pudo cargar ' + TARGET_URL); console.error(e); };
+
+  img.onerror = (e) => { alert('No se pudo cargar ' + TARGET_URL); console.error(e); };
 }
 
+/* main loop (ORB, frame skip, limited matches) */
 function processFrame(now){
   if (!streaming) return;
   try {
     frameCounter = (frameCounter + 1) % FRAME_SKIP;
     const pW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
     const pH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
+
     if (!procCanvas || procCanvas.width !== pW || procCanvas.height !== pH){
-      if (srcMat) srcMat.delete(); if (grayMat) grayMat.delete();
+      if (srcMat) { srcMat.delete(); srcMat = null; }
+      if (grayMat) { grayMat.delete(); grayMat = null; }
+
       procCanvas = document.createElement('canvas'); procCanvas.width = pW; procCanvas.height = pH;
-      procCtx = procCanvas.getContext('2d', { willReadFrequently:true });
-      srcMat = new cv.Mat(pH, pW, cv.CV_8UC4); grayMat = new cv.Mat(pH, pW, cv.CV_8UC1);
-      log('Reiniciado procesador ' + pW + 'x' + pH);
+      procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+
+      srcMat = new cv.Mat(pH, pW, cv.CV_8UC4);
+      grayMat = new cv.Mat(pH, pW, cv.CV_8UC1);
+      log('Procesador reiniciado ' + pW + 'x' + pH);
     }
-    procCtx.drawImage(cam,0,0,pW,pH);
+
+    procCtx.drawImage(cam, 0, 0, pW, pH);
     const imageData = procCtx.getImageData(0,0,pW,pH);
-    if (srcMat && srcMat.data && srcMat.data.length === imageData.data.length) srcMat.data.set(imageData.data);
-    else srcMat = cv.imread(procCanvas);
+    if (srcMat && srcMat.data && srcMat.data.length === imageData.data.length){
+      srcMat.data.set(imageData.data);
+    } else {
+      srcMat = cv.imread(procCanvas);
+    }
+
     if (frameCounter !== 0){ requestAnimationFrame(processFrame); return; }
+
     cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
-    let frameKeypoints = new cv.KeyPointVector(); let frameDescriptors = new cv.Mat();
-    try { orb.detect(grayMat, frameKeypoints); orb.compute(grayMat, frameKeypoints, frameDescriptors); }
-    catch(e){ try{ orb.detectAndCompute(grayMat, new cv.Mat(), frameKeypoints, frameDescriptors); } catch(err){ frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; } }
+
+    let frameKeypoints = new cv.KeyPointVector();
+    let frameDescriptors = new cv.Mat();
+    try {
+      orb.detect(grayMat, frameKeypoints);
+      orb.compute(grayMat, frameKeypoints, frameDescriptors);
+    } catch(e){
+      try { orb.detectAndCompute(grayMat, new cv.Mat(), frameKeypoints, frameDescriptors); } catch(err){ console.error('ORB frame err', err); frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; }
+    }
+
     const tplK = templKeypoints ? templKeypoints.size() : 0;
     const frmK = frameKeypoints ? frameKeypoints.size() : 0;
-    if (!tplK || !frmK){ ctx.clearRect(0,0,overlay.width,overlay.height); ctx.fillStyle='white'; ctx.fillText('Match: --',10,20); frameKeypoints.delete(); frameDescriptors.delete(); hideOverlay(); requestAnimationFrame(processFrame); return; }
+    if (!tplK || !frmK){
+      ctx.clearRect(0,0,overlay.width, overlay.height);
+      ctx.fillStyle='white'; ctx.font='16px Arial';
+      ctx.fillText('Match: -- (kp tpl:'+tplK+' frm:'+frmK+')',10,20);
+      frameKeypoints.delete(); frameDescriptors.delete();
+      hideOverlay();
+      requestAnimationFrame(processFrame);
+      return;
+    }
+
+    // knn match
     let matches = new cv.DMatchVectorVector();
-    try { bf.knnMatch(frameDescriptors, templDescriptors, matches, 2); } catch(e){ matches.delete(); frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; }
+    try { bf.knnMatch(frameDescriptors, templDescriptors, matches, 2); }
+    catch(e){ console.error('knnMatch err', e); matches.delete(); frameKeypoints.delete(); frameDescriptors.delete(); requestAnimationFrame(processFrame); return; }
+
+    // ratio test -> plain JS objects
     let goodMatches = [];
-    for (let i=0;i<matches.size();i++){
+    for (let i = 0; i < matches.size(); i++){
       const mv = matches.get(i);
-      if (mv.size()>=2){ const m=mv.get(0), n=mv.get(1); if (m.distance <= MATCH_RATIO*n.distance) goodMatches.push({queryIdx:m.queryIdx, trainIdx:m.trainIdx}); }
-      else if (mv.size()===1){ const m=mv.get(0); if (m.distance < 30) goodMatches.push({queryIdx:m.queryIdx, trainIdx:m.trainIdx}); }
+      if (mv.size() >= 2){
+        const m = mv.get(0), n = mv.get(1);
+        if (m.distance <= MATCH_RATIO * n.distance){
+          goodMatches.push({queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance});
+        }
+      } else if (mv.size() === 1){
+        const m = mv.get(0);
+        if (m.distance < 30) goodMatches.push({queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance});
+      }
       mv.delete();
+      // safety cap: if too many matches, stop adding
+      if (goodMatches.length >= MAX_GOOD_MATCHES) break;
     }
     matches.delete();
-    if (goodMatches.length < minMatchCount){ frameKeypoints.delete(); frameDescriptors.delete(); ctx.clearRect(0,0,overlay.width,overlay.height); ctx.fillText('Matches:'+goodMatches.length,10,20); bigMatch.textContent = 'Matches: ' + goodMatches.length; hideOverlay(); requestAnimationFrame(processFrame); return; }
-    const srcPts=[]; const dstPts=[];
-    for (let i=0;i<goodMatches.length;i++){ const gm = goodMatches[i]; const kpF = frameKeypoints.get(gm.queryIdx); const kpT = templKeypoints.get(gm.trainIdx); srcPts.push(kpF.pt.x,kpF.pt.y); dstPts.push(kpT.pt.x,kpT.pt.y); }
-    let srcMatPts = cv.matFromArray(goodMatches.length,1,cv.CV_32FC2, srcPts);
-    let dstMatPts = cv.matFromArray(goodMatches.length,1,cv.CV_32FC2, dstPts);
+
+    if (goodMatches.length < minMatchCount){
+      frameKeypoints.delete(); frameDescriptors.delete();
+      ctx.clearRect(0,0,overlay.width, overlay.height);
+      ctx.fillStyle='white'; ctx.font='16px Arial';
+      ctx.fillText('Matches: ' + goodMatches.length + ' (need '+minMatchCount+')',10,20);
+      bigMatch.textContent = 'Matches: ' + goodMatches.length;
+      hideOverlay();
+      requestAnimationFrame(processFrame);
+      return;
+    }
+
+    // build points for homography (plain arrays)
+    const srcPts = []; const dstPts = [];
+    for (let i=0; i<goodMatches.length; i++){
+      const gm = goodMatches[i];
+      const q = gm.queryIdx, t = gm.trainIdx;
+      const kpf = frameKeypoints.get(q);
+      const kpt = templKeypoints.get(t);
+      srcPts.push(kpf.pt.x, kpf.pt.y); dstPts.push(kpt.pt.x, kpt.pt.y);
+    }
+
+    let srcMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPts);
+    let dstMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPts);
     let mask = new cv.Mat();
     let H = cv.findHomography(srcMatPts, dstMatPts, cv.RANSAC, 5.0, mask);
-    let inliers=0; for (let i=0;i<mask.rows;i++) if (mask.ucharPtr(i,0)[0]) inliers++;
+
+    let inliers = 0;
+    for (let i=0;i<mask.rows;i++) if (mask.ucharPtr(i,0)[0]) inliers++;
+
     ctx.clearRect(0,0,overlay.width, overlay.height);
-    ctx.fillStyle='white'; ctx.font='16px Arial'; ctx.fillText('Matches:' + goodMatches.length + ' inliers:' + inliers,10,20);
+    ctx.fillStyle='white'; ctx.font='16px Arial';
+    ctx.fillText('Matches: ' + goodMatches.length + ' inliers:' + inliers,10,20);
     bigMatch.textContent = 'Matches: ' + goodMatches.length + ' | Inliers: ' + inliers;
-    if (!H.empty() && inliers >= Math.max(5, Math.floor(goodMatches.length*0.25))){
+
+    if (!H.empty() && inliers >= Math.max(4, Math.floor(goodMatches.length * 0.2))){
       let H_inv = new cv.Mat(); cv.invert(H, H_inv, cv.DECOMP_LU);
       const tw = templGray.cols, th = templGray.rows;
       const tplCorners = cv.matFromArray(4,1,cv.CV_32FC2, [0,0, tw,0, tw,th, 0,th]);
       let dstCorners = new cv.Mat();
       cv.perspectiveTransform(tplCorners, dstCorners, H_inv);
+
       const scaleX = overlay.width / srcMat.cols;
       const scaleY = overlay.height / srcMat.rows;
+
       const x0 = dstCorners.floatAt(0,0), y0 = dstCorners.floatAt(0,1);
       const x1 = dstCorners.floatAt(1,0), y1 = dstCorners.floatAt(1,1);
       const x2 = dstCorners.floatAt(2,0), y2 = dstCorners.floatAt(2,1);
       const x3 = dstCorners.floatAt(3,0), y3 = dstCorners.floatAt(3,1);
+
       const minX = Math.min(x0,x1,x2,x3), maxX = Math.max(x0,x1,x2,x3);
       const minY = Math.min(y0,y1,y2,y3), maxY = Math.max(y0,y1,y2,y3);
       const centerX = (minX+maxX)/2, centerY=(minY+maxY)/2;
       const drawW = (maxX-minX)*scaleX, drawH = (maxY-minY)*scaleY;
       const drawCX = centerX*scaleX, drawCY = centerY*scaleY;
+
       const angleRad = Math.atan2(y1-y0, x1-x0); const angleDeg = angleRad*180/Math.PI;
+
+      // debug polygon
       ctx.strokeStyle='rgba(0,255,150,0.95)'; ctx.lineWidth=4;
-      ctx.beginPath(); ctx.moveTo(x0*scaleX,y0*scaleY); ctx.lineTo(x1*scaleX,y1*scaleY); ctx.lineTo(x2*scaleX,y2*scaleY); ctx.lineTo(x3*scaleX,y3*scaleY); ctx.closePath(); ctx.stroke();
-      // show overlay (video with alpha)
+      ctx.beginPath();
+      ctx.moveTo(x0*scaleX, y0*scaleY);
+      ctx.lineTo(x1*scaleX, y1*scaleY);
+      ctx.lineTo(x2*scaleX, y2*scaleY);
+      ctx.lineTo(x3*scaleX, y3*scaleY);
+      ctx.closePath(); ctx.stroke();
+
+      // **show overlay** (video with alpha preferred)
       showOverlayCentered(drawCX, drawCY, drawW, drawH, angleDeg);
+
       tplCorners.delete(); dstCorners.delete(); H_inv.delete();
     } else {
       hideOverlay();
     }
-    srcMatPts.delete(); dstMatPts.delete(); mask.delete(); if (H && !H.isDeleted) H.delete();
+
+    // cleanup
+    srcMatPts.delete(); dstMatPts.delete(); mask.delete();
+    if (H && !H.isDeleted) H.delete();
     frameKeypoints.delete(); frameDescriptors.delete();
+
   } catch(err){
-    console.error('Error procesando', err);
+    console.error('Error procesando frame:', err);
   } finally {
     requestAnimationFrame(processFrame);
   }
 }
 
-/* start button & test controls */
-startBtn.addEventListener('click', async ()=>{ startBtn.style.display='none'; log('Activando cámara...'); await startCamera(); });
-testShow.addEventListener('click', ()=>{ const r = overlay.getBoundingClientRect(); showOverlayCentered(r.width/2, r.height/2, r.width*0.5, r.height*0.5, 0); });
-testHide.addEventListener('click', ()=>{ hideOverlay(); });
+/* start button */
+startBtn.addEventListener('click', async ()=>{
+  startBtn.style.display='none';
+  log('Activando cámara...');
+  await startCamera();
+});
 
 /* cleanup */
-window.addEventListener('pagehide', ()=>{ try{ if (srcMat) srcMat.delete(); if (grayMat) grayMat.delete(); if (templMat) templMat.delete(); if (templGray) templGray.delete(); if (templKeypoints) templKeypoints.delete(); if (templDescriptors) templDescriptors.delete(); }catch(e){} stopCamera(); });
+window.addEventListener('pagehide', ()=>{
+  try {
+    if (srcMat) { srcMat.delete(); srcMat = null; }
+    if (grayMat) { grayMat.delete(); grayMat = null; }
+    if (templMat) { templMat.delete(); templMat = null; }
+    if (templGray) { templGray.delete(); templGray = null; }
+    if (templKeypoints) { templKeypoints.delete(); templKeypoints = null; }
+    if (templDescriptors) { templDescriptors.delete(); templDescriptors = null; }
+  } catch(e){}
+  stopCamera();
+});
 </script>
 </body>
 </html>
