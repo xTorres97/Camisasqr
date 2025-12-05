@@ -2,30 +2,20 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Mejorado (Match fix)</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no" />
+  <title>AR Camiseta - Worker + OpenCV.js</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
     video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
-    #overlayContainer{
-      position:fixed; left:0; top:0;
-      pointer-events:none; z-index:9999;
-      display:none; transform-origin:center center;
-      background:transparent;
-      will-change: transform, opacity;
-      -webkit-transform: translate3d(0,0,0);
-    }
-    #overlayContainer > video { display:block; width:100%; height:100%; background:transparent; }
+    #overlayContainer{position:fixed; left:0; top:0; pointer-events:none; z-index:9999; display:none; transform-origin:center center; background:transparent; will-change: transform, opacity; -webkit-transform: translate3d(0,0,0);}
     #controls{position:fixed; right:12px; top:60px; z-index:10000; display:flex; flex-direction:column; gap:8px}
     .ctrlBtn{padding:10px 12px;border-radius:8px;border:none;background:#ff4fa8;color:#fff;font-weight:600}
     #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:40}
-    #note{position:fixed;left:0;right:0;bottom:10px;text-align:center;z-index:40;opacity:0.9}
     #log{position:fixed;left:8px;top:8px;background:rgba(0,0,0,0.6);padding:6px 8px;border-radius:6px;font-size:12px;z-index:40}
     #bigMatch{position:fixed;left:8px;top:48px;font-size:18px;font-weight:700;color:#fff;text-shadow:0 0 6px #000;z-index:40}
     #forcePlay{position:fixed;left:50%;top:70%;transform:translate(-50%,-50%);z-index:10001;padding:12px 18px;background:#ff4fa8;color:#fff;border-radius:8px;border:none;display:none}
-    #modeLabel{font-size:12px;padding:6px 10px;border-radius:8px;background:rgba(255,255,255,0.06);display:inline-block}
   </style>
 </head>
 <body>
@@ -40,609 +30,239 @@
     <button id="testShow" class="ctrlBtn">Mostrar animación de prueba</button>
     <button id="testHide" class="ctrlBtn">Ocultar animación</button>
     <button id="toggleMode" class="ctrlBtn">Modo: Precisión</button>
-    <div id="modeLabel">RES_SCALE: <span id="mscale">0.40</span></div>
   </div>
 
   <button id="startBtn">Activar AR</button>
   <button id="forcePlay">Toca para reproducir animación</button>
 
-  <div id="note">Apunta la cámara hacia la imagen de la camiseta</div>
-  <div id="log">listo</div>
+  <div id="log">iniciando...</div>
   <div id="bigMatch">Match: --</div>
 
-  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <script>
+  // ---------- CONFIG ----------
+  const TARGET_URL = './ilustracion.png';
+  const ANIM_URL = './Animacion.webm';
 
-<script>
-/* ---------- CONFIG (AJUSTABLE) ---------- */
-let RES_SCALE = 0.40;        // escala de procesamiento (pruebas)
-let FRAME_SKIP = 3;          // procesar 1 cada N frames
-let MATCH_RATIO = 0.9;       // ratio de Lowe (relajado)
-let minMatchCount = 6;
-let MAX_GOOD_MATCHES = 150;  // cap para matches
-const MAX_TEMPL_SIZE = 800;
-const MIN_TRACK_POINTS = 6;
-const REDETECT_AFTER_SECONDS = 2.5;
+  // modos y performance
+  let RES_SCALE = 0.40;     // escala de procesamiento (ajusta con toggle)
+  let FRAME_SKIP = 3;
+  let MODE = 'precision';   // 'precision'|'speed'
 
-const TARGET_URL = './ilustracion.png';
-const ANIM_URL = './Animacion.webm';
-/* ---------------------------------------- */
+  // DOM
+  const cam = document.getElementById('cam');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+  const overlayContainer = document.getElementById('overlayContainer');
+  const startBtn = document.getElementById('startBtn');
+  const logEl = document.getElementById('log');
+  const bigMatch = document.getElementById('bigMatch');
+  const testShow = document.getElementById('testShow');
+  const testHide = document.getElementById('testHide');
+  const toggleMode = document.getElementById('toggleMode');
+  const forcePlay = document.getElementById('forcePlay');
 
-/* Estado y elementos DOM */
-const cam = document.getElementById('cam');
-const overlay = document.getElementById('overlay');
-const ctx = overlay.getContext('2d');
-const startBtn = document.getElementById('startBtn');
-const logEl = document.getElementById('log');
-const bigMatch = document.getElementById('bigMatch');
-const overlayContainer = document.getElementById('overlayContainer');
-const testShow = document.getElementById('testShow');
-const testHide = document.getElementById('testHide');
-const forcePlay = document.getElementById('forcePlay');
-const toggleModeBtn = document.getElementById('toggleMode');
-const modeScaleEl = document.getElementById('mscale');
+  // Worker
+  let worker = null;
+  let streaming = false;
+  let frameCounter = 0;
+  let procW = 1, procH = 1;
+  let offscreenForTransfer = null; // OffscreenCanvas for producing ImageBitmap
+  let videoTrackSettings = null;
 
-let videoStream = null, streaming = false;
-let srcMat=null, grayMat=null, templMat=null, templGray=null;
-let procCanvas=null, procCtx=null;
-let orb=null, bf=null, templKeypoints=null, templDescriptors=null;
-let frameCounter = 0;
-let detectionLockedUntil = 0;
+  function log(s){ logEl.textContent = s; console.log(s); }
 
-/* tracking estado (optical flow) */
-let trackingActive = false;
-let prevGray = null;
-let prevPts = null;
-let templPts = null;
-let lastValidHomography = null;
-let lastTrackTime = 0;
+  /* overlay video markup (same as before) */
+  const overlayVideoMarkup = (filename) => `
+    <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="background:transparent;display:block;">
+      <source src="${filename}" type="video/webm">
+      <source src="${filename.replace('.webm','.mp4')}" type="video/mp4">
+    </video>`;
 
-/* matcher config */
-let USE_CROSSCHECK = false; // por defecto false para usar knnMatch (evita problemas en builds web)
+  function showOverlayCentered(cx, cy, w, h, angleDeg = 0, small=false){
+    const rect = overlay.getBoundingClientRect();
+    const screenX = rect.left + cx + window.scrollX;
+    const screenY = rect.top + cy + window.scrollY;
 
-/* UI helpers */
-function log(s){ logEl.textContent = s; console.log(s); }
-function setModeLabel(){ modeScaleEl.textContent = RES_SCALE.toFixed(2); }
-
-/* overlay video markup */
-const overlayVideoMarkup = (filename) => `
-  <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="background:transparent;display:block;">
-    <source src="${filename}" type="video/webm">
-    <source src="${filename.replace('.webm','.mp4')}" type="video/mp4">
-  </video>`;
-
-/* show overlay centered (cx,cy center in overlay canvas coords) */
-function showOverlayCentered(cx, cy, w, h, angleDeg = 0){
-  const rect = overlay.getBoundingClientRect();
-  const screenX = rect.left + cx + window.scrollX;
-  const screenY = rect.top + cy + window.scrollY;
-
-  if (!document.getElementById('fxVideo')){
-    overlayContainer.innerHTML = overlayVideoMarkup(ANIM_URL);
-  }
-  const fx = document.getElementById('fxVideo');
-  overlayContainer.style.left = screenX + 'px';
-  overlayContainer.style.top  = screenY + 'px';
-  overlayContainer.style.width = Math.max(10, w) + 'px';
-  overlayContainer.style.height = Math.max(10, h) + 'px';
-  overlayContainer.style.display = 'block';
-  overlayContainer.style.visibility = 'visible';
-  overlayContainer.style.transform = `translate(-50%,-50%) rotate(${angleDeg}deg) translate3d(0,0,0)`;
-  fx.style.width = '100%'; fx.style.height = '100%'; fx.style.objectFit = 'cover';
-  fx.play().then(()=>{ log('video play ok'); forcePlay.style.display='none'; }).catch(err=>{ log('Autoplay error: '+err); forcePlay.style.display='block'; });
-}
-function hideOverlay(){ const fx = document.getElementById('fxVideo'); if (fx) try{ fx.pause(); }catch(e){} overlayContainer.style.display='none'; overlayContainer.style.visibility='hidden'; }
-
-/* forcePlay helper */
-forcePlay.addEventListener('click', ()=>{ const fx = document.getElementById('fxVideo'); if (fx) { fx.play().catch(()=>{}); forcePlay.style.display='none'; } });
-
-/* test buttons */
-testShow.addEventListener('click', ()=>{ const r = overlay.getBoundingClientRect(); showOverlayCentered(r.width/2, r.height/2, r.width*0.5, r.height*0.5, 0); });
-testHide.addEventListener('click', ()=>{ hideOverlay(); });
-
-/* toggle precision/velocidad */
-let currentMode = 'precision'; // 'precision' | 'speed'
-toggleModeBtn.addEventListener('click', ()=>{
-  if (currentMode === 'precision'){
-    currentMode = 'speed';
-    RES_SCALE = 0.28;
-    FRAME_SKIP = 4;
-    MATCH_RATIO = 0.85;
-    MAX_GOOD_MATCHES = 80;
-    USE_CROSSCHECK = false;
-    toggleModeBtn.textContent = 'Modo: Velocidad';
-    log('Modo Velocidad activado');
-  } else {
-    currentMode = 'precision';
-    RES_SCALE = 0.40;
-    FRAME_SKIP = 3;
-    MATCH_RATIO = 0.9;
-    MAX_GOOD_MATCHES = 150;
-    USE_CROSSCHECK = false;
-    toggleModeBtn.textContent = 'Modo: Precisión';
-    log('Modo Precisión activado');
-  }
-  setModeLabel();
-});
-
-/* camera start/stop */
-async function startCamera(){
-  try {
-    videoStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
-    cam.srcObject = videoStream;
-    await cam.play();
-    streaming = true;
-    resizeCanvas();
-    prepareOpenCV();
-  } catch(e){
-    alert('Error al abrir la cámara: ' + e.message);
-    console.error(e);
-  }
-}
-function stopCamera(){ if (videoStream) videoStream.getTracks().forEach(t=>t.stop()); streaming=false; }
-function resizeCanvas(){ overlay.width = cam.videoWidth; overlay.height = cam.videoHeight; overlay.style.width = cam.clientWidth + 'px'; overlay.style.height = cam.clientHeight + 'px'; }
-
-/* prepareOpenCV: carga template, aplica CLAHE, init ORB/BF */
-async function prepareOpenCV(){
-  log("Esperando OpenCV...");
-  if (typeof cv === 'undefined' || !cv.imread){
-    let waited=0;
-    while((typeof cv === 'undefined' || !cv.imread) && waited<8000){ await new Promise(r=>setTimeout(r,100)); waited+=100; }
-  }
-  if (typeof cv === 'undefined' || !cv.imread){ alert('OpenCV no cargó'); return; }
-
-  log('OpenCV listo — cargando template...');
-  const img = new Image();
-  img.crossOrigin = 'anonymous';
-  img.src = TARGET_URL + '?v=' + Date.now();
-
-  img.onload = () => {
-    const tmp = document.createElement('canvas');
-    let tw = img.width, th = img.height;
-    if (Math.max(tw,th) > MAX_TEMPL_SIZE){
-      const s = MAX_TEMPL_SIZE / Math.max(tw,th);
-      tw = Math.round(tw * s); th = Math.round(th * s);
+    if (!document.getElementById('fxVideo')){
+      overlayContainer.innerHTML = overlayVideoMarkup(small ? ANIM_URL.replace('.webm','_small.webm') : ANIM_URL);
     }
-    tmp.width = tw; tmp.height = th;
-    const tctx = tmp.getContext('2d');
-    tctx.drawImage(img, 0, 0, tw, th);
-
-    try{ if (templKeypoints){ templKeypoints.delete(); templKeypoints = null; } }catch(e){}
-    try{ if (templDescriptors){ templDescriptors.delete(); templDescriptors = null; } }catch(e){}
-    try{ if (templMat){ templMat.delete(); templMat = null; } }catch(e){}
-    try{ if (templGray){ templGray.delete(); templGray = null; } }catch(e){}
-
-    templMat = cv.imread(tmp);
-    templGray = new cv.Mat();
-    cv.cvtColor(templMat, templGray, cv.COLOR_RGBA2GRAY);
-
-    // APPLY CLAHE (si disponible)
-    try {
-      let clahe = new cv.CLAHE(2.0, new cv.Size(8,8));
-      let templGrayEq = new cv.Mat();
-      clahe.apply(templGray, templGrayEq);
-      templGray.delete();
-      templGray = templGrayEq;
-      clahe.delete();
-      console.log('CLAHE aplicado al template');
-    } catch(e){ console.warn('CLAHE no disponible en esta build, se ignora', e); }
-
-    // init ORB & BFMatcher (USE_CROSSCHECK variable controla modo)
-    try {
-      try { orb = new cv.ORB(1000, 1.2, 8, 31, 0, 2, cv.ORB_HARRIS_SCORE, 31, 20); } catch(e){ orb = new cv.ORB(); }
-      bf = new cv.BFMatcher(cv.NORM_HAMMING, USE_CROSSCHECK ? true : false);
-    } catch(e){
-      console.warn('ORB/BF init error', e);
-      try { orb = new cv.ORB(); bf = new cv.BFMatcher(cv.NORM_HAMMING, false); } catch(err){ console.error(err); }
-    }
-
-    templKeypoints = new cv.KeyPointVector();
-    templDescriptors = new cv.Mat();
-    try {
-      orb.detect(templGray, templKeypoints);
-      orb.compute(templGray, templKeypoints, templDescriptors);
-    } catch(e){
-      try { orb.detectAndCompute(templGray, new cv.Mat(), templKeypoints, templDescriptors); } catch(err){ alert('ORB detect/compute falló en template'); console.error(err); return; }
-    }
-
-    log('Template loaded. KP:'+templKeypoints.size() + ' desc rows:' + templDescriptors.rows);
-    console.log('Template size (w,h):', templGray.cols, templGray.rows);
-
-    /* prepare processing mats at scaled resolution */
-    const procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
-    const procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
-    procCanvas = document.createElement('canvas'); procCanvas.width = procW; procCanvas.height = procH;
-    procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
-
-    if (srcMat) srcMat.delete(); if (grayMat) grayMat.delete();
-    srcMat = new cv.Mat(procH, procW, cv.CV_8UC4);
-    grayMat = new cv.Mat(procH, procW, cv.CV_8UC1);
-
-    // start loop
-    setModeLabel();
-    scheduleNextFrame();
-  };
-
-  img.onerror = (e) => { alert('No se pudo cargar ' + TARGET_URL); console.error(e); };
-}
-
-/* schedule frame callback (video-synced si posible) */
-function scheduleNextFrame(){
-  if (!streaming) return;
-  if (cam.requestVideoFrameCallback){
-    cam.requestVideoFrameCallback(()=>processFrame(performance.now()));
-  } else {
-    requestAnimationFrame(processFrame);
+    const fx = document.getElementById('fxVideo');
+    overlayContainer.style.left = screenX + 'px';
+    overlayContainer.style.top  = screenY + 'px';
+    overlayContainer.style.width = Math.max(10, w) + 'px';
+    overlayContainer.style.height = Math.max(10, h) + 'px';
+    overlayContainer.style.display = 'block';
+    overlayContainer.style.visibility = 'visible';
+    overlayContainer.style.transform = `translate(-50%,-50%) rotate(${angleDeg}deg) translate3d(0,0,0)`;
+    fx.style.width = '100%'; fx.style.height = '100%'; fx.style.objectFit = 'cover';
+    fx.play().then(()=>{ log('video play ok'); forcePlay.style.display='none'; }).catch(err=>{ log('Autoplay error: '+err); forcePlay.style.display='block'; });
   }
-}
+  function hideOverlay(){ const fx = document.getElementById('fxVideo'); if (fx) try{ fx.pause(); }catch(e){} overlayContainer.style.display='none'; overlayContainer.style.visibility='hidden'; }
 
-/* main loop: si trackingActive -> optical flow; si no -> ORB detection */
-function processFrame(now){
-  if (!streaming) return;
-  try {
-    frameCounter = (frameCounter + 1) % FRAME_SKIP;
+  forcePlay.addEventListener('click', ()=>{ const fx = document.getElementById('fxVideo'); if (fx) fx.play().catch(()=>{}); forcePlay.style.display='none'; });
 
-    const pW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
-    const pH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
+  testShow.addEventListener('click', ()=>{ const r = overlay.getBoundingClientRect(); showOverlayCentered(r.width/2, r.height/2, r.width*0.5, r.height*0.5, 0); });
+  testHide.addEventListener('click', ()=>{ hideOverlay(); });
 
-    // ensure procCanvas matches size
-    if (!procCanvas || procCanvas.width !== pW || procCanvas.height !== pH){
-      if (srcMat) { srcMat.delete(); srcMat = null; }
-      if (grayMat) { grayMat.delete(); grayMat = null; }
-
-      procCanvas = document.createElement('canvas'); procCanvas.width = pW; procCanvas.height = pH;
-      procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
-
-      srcMat = new cv.Mat(pH, pW, cv.CV_8UC4);
-      grayMat = new cv.Mat(pH, pW, cv.CV_8UC1);
-      log('Procesador reiniciado ' + pW + 'x' + pH);
-    }
-
-    procCtx.drawImage(cam, 0, 0, pW, pH);
-    const imageData = procCtx.getImageData(0,0,pW,pH);
-    if (srcMat && srcMat.data && srcMat.data.length === imageData.data.length){
-      srcMat.data.set(imageData.data);
+  toggleMode.addEventListener('click', ()=>{
+    if (MODE === 'precision'){
+      MODE = 'speed'; RES_SCALE = 0.22; FRAME_SKIP = 5; toggleMode.textContent = 'Modo: Velocidad'; log('Modo velocidad');
     } else {
-      if (srcMat) try{ srcMat.delete(); }catch(e){}
-      srcMat = cv.imread(procCanvas);
+      MODE = 'precision'; RES_SCALE = 0.40; FRAME_SKIP = 3; toggleMode.textContent = 'Modo: Precisión'; log('Modo precisión');
     }
-    cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY);
+    // reinit offscreen with new size on next frame
+  });
 
-    // aplicar CLAHE en frame si está disponible
+  startBtn.addEventListener('click', async ()=>{
+    startBtn.style.display='none';
+    log('Activando cámara...');
+    await startCamera();
+  });
+
+  async function startCamera(){
     try {
-      let claheF = new cv.CLAHE(2.0, new cv.Size(8,8));
-      let frameEq = new cv.Mat();
-      claheF.apply(grayMat, frameEq);
-      grayMat.delete();
-      grayMat = frameEq;
-      claheF.delete();
-    } catch(e){ /* no disponible: ok */ }
-
-    // Si tracking activo -> optical flow
-    if (trackingActive){
-      if (performance.now() - lastTrackTime > REDETECT_AFTER_SECONDS * 1000){
-        trackingActive = false;
-        log('Forzando re-detección por tiempo');
-      } else {
-        try {
-          let nextPts = new cv.Mat();
-          let status = new cv.Mat();
-          let err = new cv.Mat();
-          cv.calcOpticalFlowPyrLK(prevGray, grayMat, prevPts, nextPts, status, err, new cv.Size(21,21), 3);
-
-          const goodNext = [];
-          const goodTempl = [];
-          for (let i=0;i<status.rows;i++){
-            if (status.ucharPtr(i,0)[0] === 1){
-              const nx = nextPts.floatAt(i,0);
-              const ny = nextPts.floatAt(i,1);
-              const tx = templPts.floatAt(i,0);
-              const ty = templPts.floatAt(i,1);
-              if (!isFinite(nx) || !isFinite(ny)) continue;
-              goodNext.push(nx, ny);
-              goodTempl.push(tx, ty);
-            }
-          }
-
-          nextPts.delete(); status.delete(); err.delete();
-
-          if (goodNext.length / 2 < MIN_TRACK_POINTS){
-            trackingActive = false;
-            log('Tracking falló (pocos puntos). Volviendo a detección completa.');
-            try{ if (prevPts){ prevPts.delete(); prevPts = null; } }catch(e){}
-            try{ if (prevGray){ prevGray.delete(); prevGray = null; } }catch(e){}
-          } else {
-            const n = goodNext.length/2;
-            const nextMat = cv.matFromArray(n, 1, cv.CV_32FC2, goodNext);
-            const templSubMat = cv.matFromArray(n, 1, cv.CV_32FC2, goodTempl);
-            let mask = new cv.Mat();
-            let H = cv.findHomography(nextMat, templSubMat, cv.RANSAC, 5.0, mask);
-
-            let inliers = 0;
-            for (let i=0;i<mask.rows;i++) if (mask.ucharPtr(i,0)[0]) inliers++;
-
-            ctx.clearRect(0,0,overlay.width, overlay.height);
-            ctx.fillStyle='white'; ctx.font='14px Arial';
-            ctx.fillText('Tracking points: ' + n + ' inliers:' + inliers,10,20);
-            bigMatch.textContent = 'Track pts:' + n + ' | Inliers:' + inliers;
-
-            if (!H.empty() && inliers >= Math.max(4, Math.floor(n * 0.25))){
-              let H_inv = new cv.Mat(); cv.invert(H, H_inv, cv.DECOMP_LU);
-              const tw = templGray.cols, th = templGray.rows;
-              const tplCorners = cv.matFromArray(4,1,cv.CV_32FC2, [0,0, tw,0, tw,th, 0,th]);
-              let dstCorners = new cv.Mat();
-              cv.perspectiveTransform(tplCorners, dstCorners, H_inv);
-
-              const scaleX = overlay.width / srcMat.cols;
-              const scaleY = overlay.height / srcMat.rows;
-
-              const x0 = dstCorners.floatAt(0,0), y0 = dstCorners.floatAt(0,1);
-              const x1 = dstCorners.floatAt(1,0), y1 = dstCorners.floatAt(1,1);
-              const x2 = dstCorners.floatAt(2,0), y2 = dstCorners.floatAt(2,1);
-              const x3 = dstCorners.floatAt(3,0), y3 = dstCorners.floatAt(3,1);
-
-              const minX = Math.min(x0,x1,x2,x3), maxX = Math.max(x0,x1,x2,x3);
-              const minY = Math.min(y0,y1,y2,y3), maxY = Math.max(y0,y1,y2,y3);
-              const centerX = (minX+maxX)/2, centerY=(minY+maxY)/2;
-              const drawW = (maxX-minX)*scaleX, drawH = (maxY-minY)*scaleY;
-              const drawCX = centerX*scaleX, drawCY = centerY*scaleY;
-              const angleRad = Math.atan2(y1-y0, x1-x0); const angleDeg = angleRad*180/Math.PI;
-
-              ctx.strokeStyle='rgba(0,255,150,0.95)'; ctx.lineWidth=3;
-              ctx.beginPath();
-              ctx.moveTo(x0*scaleX, y0*scaleY);
-              ctx.lineTo(x1*scaleX, y1*scaleY);
-              ctx.lineTo(x2*scaleX, y2*scaleY);
-              ctx.lineTo(x3*scaleX, y3*scaleY);
-              ctx.closePath(); ctx.stroke();
-
-              showOverlayCentered(drawCX, drawCY, drawW, drawH, angleDeg);
-              if (lastValidHomography){ lastValidHomography.delete(); lastValidHomography = null; }
-              lastValidHomography = H.clone();
-              H_inv.delete(); tplCorners.delete(); dstCorners.delete();
-            } else {
-              hideOverlay();
-            }
-
-            // build filtered prevPts & templPts by mask
-            const goodNextFiltered = [];
-            const goodTemplFiltered = [];
-            for (let i=0;i<mask.rows;i++){
-              if (mask.ucharPtr(i,0)[0]){
-                goodNextFiltered.push(goodNext[2*i], goodNext[2*i+1]);
-                goodTemplFiltered.push(goodTempl[2*i], goodTempl[2*i+1]);
-              }
-            }
-
-            try{ if (prevPts){ prevPts.delete(); prevPts = null; } }catch(e){}
-            try{ if (prevGray){ prevGray.delete(); prevGray = null; } }catch(e){}
-            try{ if (templPts){ templPts.delete(); templPts = null; } }catch(e){}
-
-            prevPts = cv.matFromArray(goodNextFiltered.length/2, 1, cv.CV_32FC2, goodNextFiltered);
-            templPts = cv.matFromArray(goodTemplFiltered.length/2, 1, cv.CV_32FC2, goodTemplFiltered);
-            prevGray = grayMat.clone();
-            lastTrackTime = performance.now();
-
-            nextMat.delete(); templSubMat.delete(); mask.delete();
-            if (H && !H.isDeleted) H.delete();
-          }
-
-        } catch(err){
-          console.error('Optical flow error', err);
-          trackingActive = false;
-        }
-
-        scheduleNextFrame();
-        return;
-      }
-    }
-
-    // si no tracking: ejecutar detección cada FRAME_SKIP frames
-    if (frameCounter !== 0){
-      ctx.clearRect(0,0,overlay.width, overlay.height);
-      ctx.fillStyle='white'; ctx.font='14px Arial';
-      ctx.fillText('Esperando detección... (frameskip: '+FRAME_SKIP+')',10,20);
-      scheduleNextFrame();
-      return;
-    }
-
-    // ORB detection + matching
-    let frameKeypoints = new cv.KeyPointVector();
-    let frameDescriptors = new cv.Mat();
-    try {
-      orb.detect(grayMat, frameKeypoints);
-      orb.compute(grayMat, frameKeypoints, frameDescriptors);
+      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+      cam.srcObject = stream;
+      await cam.play();
+      streaming = true;
+      videoTrackSettings = stream.getVideoTracks()[0].getSettings();
+      resizeCanvas();
+      initWorker();
+      scheduleFrame(); // start loop
     } catch(e){
-      try { orb.detectAndCompute(grayMat, new cv.Mat(), frameKeypoints, frameDescriptors); } catch(err){ console.error('ORB frame err', err); frameKeypoints.delete(); frameDescriptors.delete(); scheduleNextFrame(); return; }
+      alert('Error al abrir la cámara: ' + e.message);
+      console.error(e);
     }
+  }
 
-    const tplK = templKeypoints ? templKeypoints.size() : 0;
-    const frmK = frameKeypoints ? frameKeypoints.size() : 0;
-    console.log('templ KP:', tplK, 'frame KP:', frmK, 'frame desc rows:', frameDescriptors.rows);
-
-    if (!tplK || !frmK){
-      ctx.clearRect(0,0,overlay.width, overlay.height);
-      ctx.fillStyle='white'; ctx.font='14px Arial';
-      ctx.fillText('Match: -- (kp tpl:'+tplK+' frm:'+frmK+')',10,20);
-      frameKeypoints.delete(); frameDescriptors.delete();
-      hideOverlay();
-      scheduleNextFrame();
-      return;
+  function resizeCanvas(){
+    overlay.width = cam.videoWidth;
+    overlay.height = cam.videoHeight;
+    overlay.style.width = cam.clientWidth + 'px';
+    overlay.style.height = cam.clientHeight + 'px';
+    // update proc sizes
+    procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
+    procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
+    // create OffscreenCanvas sized for transfer
+    try {
+      offscreenForTransfer = new OffscreenCanvas(procW, procH);
+    } catch(e){
+      // fallback: canvas element (slower). We'll create hidden canvas
+      const c = document.createElement('canvas');
+      c.width = procW; c.height = procH;
+      offscreenForTransfer = c; // will use transferToImageBitmap not available -> use bitmapFromCanvas
     }
+  }
 
-    // matching: safe handling para builds que no exponen m.delete()
-    let goodMatches = [];
-    if (bf && USE_CROSSCHECK){
-      // Uso de match() con verificación segura de propiedades del objeto devuelto
-      try {
-        let allMatches = new cv.DMatchVector();
-        bf.match(frameDescriptors, templDescriptors, allMatches);
-        for (let i=0;i<allMatches.size();i++){
-          const m = allMatches.get(i);
-          if (m && typeof m.distance !== 'undefined'){
-            if (m.distance < 70){
-              goodMatches.push({queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance});
-            }
-          }
-          if (goodMatches.length >= MAX_GOOD_MATCHES) break;
-          // NO llamamos a m.delete() aquí (puede no existir)
-        }
-        try{ allMatches.delete(); }catch(e){}
-      } catch(e){ console.error('bf.match err', e); }
-    } else {
-      // knnMatch con ratio test (comprobaciones seguras)
-      let matches = new cv.DMatchVectorVector();
-      try { bf.knnMatch(frameDescriptors, templDescriptors, matches, 2); }
-      catch(e){ console.error('knnMatch err', e); }
-      for (let i = 0; i < matches.size(); i++){
-        const mv = matches.get(i);
-        if (mv.size() >= 2){
-          const m = mv.get(0), n = mv.get(1);
-          if (m && n && typeof m.distance !== 'undefined' && typeof n.distance !== 'undefined'){
-            if (m.distance <= MATCH_RATIO * n.distance){
-              goodMatches.push({queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance});
-            }
-          }
-          // no llamamos a m.delete() ni n.delete()
-        } else if (mv.size() === 1){
-          const m = mv.get(0);
-          if (m && typeof m.distance !== 'undefined' && m.distance < 40) goodMatches.push({queryIdx: m.queryIdx, trainIdx: m.trainIdx, distance: m.distance});
-        }
-        try{ mv.delete(); }catch(e){}
-        if (goodMatches.length >= MAX_GOOD_MATCHES) break;
+  /* init worker and send init message */
+  function initWorker(){
+    if (worker) { worker.terminate(); worker = null; }
+    worker = new Worker('worker.js');
+    worker.onmessage = (ev) => {
+      const d = ev.data;
+      if (d.type === 'ready'){
+        log('Worker ready — cargando template...');
+        // send init (template URL + params)
+        worker.postMessage({type:'init', targetUrl: TARGET_URL, procW: procW, procH: procH});
+      } else if (d.type === 'log'){
+        console.log('worker:', d.msg);
+      } else if (d.type === 'result'){
+        // Resultado del worker: corners en proc-coords o null
+        handleWorkerResult(d);
+      } else if (d.type === 'error'){
+        console.error('Worker error:', d.msg);
       }
-      try{ matches.delete(); }catch(e){}
-    }
+    };
+  }
 
-    console.log('Good matches:', goodMatches.length);
-    if (goodMatches.length < minMatchCount){
-      frameKeypoints.delete(); frameDescriptors.delete();
-      ctx.clearRect(0,0,overlay.width, overlay.height);
-      ctx.fillStyle='white'; ctx.font='14px Arial';
-      ctx.fillText('Matches: ' + goodMatches.length + ' (need '+minMatchCount+')',10,20);
-      bigMatch.textContent = 'Matches: ' + goodMatches.length;
-      hideOverlay();
-      scheduleNextFrame();
-      return;
-    }
+  /* procesa la respuesta del worker */
+  function handleWorkerResult(d){
+    // d = {type:'result', matches, inliers, corners: [x0,y0,x1,y1,...] or null, angleDeg}
+    bigMatch.textContent = `Matches: ${d.matches} | Inliers: ${d.inliers}`;
+    if (d.corners && d.corners.length === 8){
+      // corners están en coords de imagen procesada (procW x procH). Convertir a canvas overlay coords.
+      const scaleX = overlay.width / procW;
+      const scaleY = overlay.height / procH;
+      const x0 = d.corners[0]*scaleX, y0 = d.corners[1]*scaleY;
+      const x1 = d.corners[2]*scaleX, y1 = d.corners[3]*scaleY;
+      const x2 = d.corners[4]*scaleX, y2 = d.corners[5]*scaleY;
+      const x3 = d.corners[6]*scaleX, y3 = d.corners[7]*scaleY;
 
-    // crear puntos para homography
-    const srcPtsArr = []; const dstPtsArr = [];
-    for (let i=0;i<goodMatches.length;i++){
-      const gm = goodMatches[i];
-      const q = gm.queryIdx, t = gm.trainIdx;
-      const kpf = frameKeypoints.get(q);
-      const kpt = templKeypoints.get(t);
-      srcPtsArr.push(kpf.pt.x, kpf.pt.y); // frame coords (proc scale)
-      dstPtsArr.push(kpt.pt.x, kpt.pt.y); // template coords
-    }
-
-    let srcMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, srcPtsArr);
-    let dstMatPts = cv.matFromArray(goodMatches.length, 1, cv.CV_32FC2, dstPtsArr);
-    let mask = new cv.Mat();
-    let H = cv.findHomography(srcMatPts, dstMatPts, cv.RANSAC, 5.0, mask);
-
-    let inliers = 0;
-    for (let i=0;i<mask.rows;i++) if (mask.ucharPtr(i,0)[0]) inliers++;
-
-    ctx.clearRect(0,0,overlay.width, overlay.height);
-    ctx.fillStyle='white'; ctx.font='14px Arial';
-    ctx.fillText('Matches: ' + goodMatches.length + ' inliers:' + inliers,10,20);
-    bigMatch.textContent = 'Matches: ' + goodMatches.length + ' | Inliers: ' + inliers;
-
-    if (!H.empty() && inliers >= Math.max(4, Math.floor(goodMatches.length * 0.2))){
-      // prepare for optical flow tracking: gather only inlier points
-      const goodFramePts = [];
-      const goodTemplPts = [];
-      for (let i=0;i<mask.rows;i++){
-        if (mask.ucharPtr(i,0)[0]){
-          goodFramePts.push(srcPtsArr[2*i], srcPtsArr[2*i+1]);
-          goodTemplPts.push(dstPtsArr[2*i], dstPtsArr[2*i+1]);
-        }
-      }
-
-      // setup prevGray, prevPts, templPts
-      try{ if (prevGray){ prevGray.delete(); prevGray = null; } }catch(e){}
-      try{ if (prevPts){ prevPts.delete(); prevPts = null; } }catch(e){}
-      try{ if (templPts){ templPts.delete(); templPts = null; } }catch(e){}
-
-      prevPts = cv.matFromArray(goodFramePts.length/2, 1, cv.CV_32FC2, goodFramePts);
-      templPts = cv.matFromArray(goodTemplPts.length/2, 1, cv.CV_32FC2, goodTemplPts);
-      prevGray = grayMat.clone();
-      trackingActive = true;
-      lastTrackTime = performance.now();
-
-      // draw overlay now
-      let H_inv = new cv.Mat(); cv.invert(H, H_inv, cv.DECOMP_LU);
-      const tw = templGray.cols, th = templGray.rows;
-      const tplCorners = cv.matFromArray(4,1,cv.CV_32FC2, [0,0, tw,0, tw,th, 0,th]);
-      let dstCorners = new cv.Mat();
-      cv.perspectiveTransform(tplCorners, dstCorners, H_inv);
-
-      const scaleX = overlay.width / srcMat.cols;
-      const scaleY = overlay.height / srcMat.rows;
-
-      const x0 = dstCorners.floatAt(0,0), y0 = dstCorners.floatAt(0,1);
-      const x1 = dstCorners.floatAt(1,0), y1 = dstCorners.floatAt(1,1);
-      const x2 = dstCorners.floatAt(2,0), y2 = dstCorners.floatAt(2,1);
-      const x3 = dstCorners.floatAt(3,0), y3 = dstCorners.floatAt(3,1);
-
+      // bbox center/size/angle
       const minX = Math.min(x0,x1,x2,x3), maxX = Math.max(x0,x1,x2,x3);
       const minY = Math.min(y0,y1,y2,y3), maxY = Math.max(y0,y1,y2,y3);
-      const centerX = (minX+maxX)/2, centerY=(minY+maxY)/2;
-      const drawW = (maxX-minX)*scaleX, drawH = (maxY-minY)*scaleY;
-      const drawCX = centerX*scaleX, drawCY = centerY*scaleY;
+      const centerX = (minX+maxX)/2, centerY = (minY+maxY)/2;
+      const drawW = (maxX-minX), drawH = (maxY-minY);
+      // angle from edge 0->1
       const angleRad = Math.atan2(y1-y0, x1-x0); const angleDeg = angleRad*180/Math.PI;
 
+      // draw debug polygon (optional)
+      ctx.clearRect(0,0,overlay.width,overlay.height);
       ctx.strokeStyle='rgba(0,255,150,0.95)'; ctx.lineWidth=3;
       ctx.beginPath();
-      ctx.moveTo(x0*scaleX, y0*scaleY);
-      ctx.lineTo(x1*scaleX, y1*scaleY);
-      ctx.lineTo(x2*scaleX, y2*scaleY);
-      ctx.lineTo(x3*scaleX, y3*scaleY);
-      ctx.closePath(); ctx.stroke();
+      ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3); ctx.closePath(); ctx.stroke();
 
-      showOverlayCentered(drawCX, drawCY, drawW, drawH, angleDeg);
-
-      tplCorners.delete(); dstCorners.delete(); H_inv.delete();
+      // show overlay centered
+      showOverlayCentered(centerX, centerY, drawW, drawH, angleDeg, MODE==='speed');
     } else {
+      // no corners => hide overlay
+      ctx.clearRect(0,0,overlay.width,overlay.height);
       hideOverlay();
     }
-
-    // cleanup
-    srcMatPts.delete(); dstMatPts.delete(); mask.delete();
-    if (H && !H.isDeleted) H.delete();
-    frameKeypoints.delete(); frameDescriptors.delete();
-
-  } catch(err){
-    console.error('Error procesando frame:', err);
-  } finally {
-    scheduleNextFrame();
   }
-}
 
-/* start button */
-startBtn.addEventListener('click', async ()=>{
-  startBtn.style.display='none';
-  log('Activando cámara...');
-  await startCamera();
-});
+  /* capture frame, downscale, transfer to worker */
+  async function sendFrameToWorker(){
+    if (!streaming || !worker) return;
+    // recompute procW/procH if RES_SCALE changed
+    const newW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
+    const newH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
+    if (newW !== procW || newH !== procH){
+      procW = newW; procH = newH; resizeCanvas(); // reinit offscreen
+      // inform worker that proc size changed
+      worker.postMessage({type:'resize', procW, procH});
+    }
 
-/* cleanup on unload */
-window.addEventListener('pagehide', ()=>{
-  try {
-    if (srcMat) { srcMat.delete(); srcMat = null; }
-    if (grayMat) { grayMat.delete(); grayMat = null; }
-    if (templMat) { templMat.delete(); templMat = null; }
-    if (templGray) { templGray.delete(); templGray = null; }
-    if (templKeypoints) { templKeypoints.delete(); templKeypoints = null; }
-    if (templDescriptors) { templDescriptors.delete(); templDescriptors = null; }
-    if (prevPts) { prevPts.delete(); prevPts = null; }
-    if (prevGray) { prevGray.delete(); prevGray = null; }
-    if (templPts) { templPts.delete(); templPts = null; }
-    if (lastValidHomography){ lastValidHomography.delete(); lastValidHomography = null; }
-  } catch(e){}
-  stopCamera();
-});
-</script>
+    // draw video into offscreen and transfer as ImageBitmap
+    try {
+      let ctx2 = offscreenForTransfer.getContext ? offscreenForTransfer.getContext('2d') : offscreenForTransfer.getContext('2d');
+      ctx2.drawImage(cam, 0, 0, procW, procH);
+
+      // transfer ImageBitmap
+      let bitmap;
+      if (offscreenForTransfer.transferToImageBitmap){
+        bitmap = offscreenForTransfer.transferToImageBitmap();
+      } else {
+        // fallback: convert canvas to blob then to ImageBitmap
+        const blob = await new Promise(res=> offscreenForTransfer.toBlob(res, 'image/png'));
+        bitmap = await createImageBitmap(blob);
+      }
+
+      // send to worker (transfer the bitmap)
+      worker.postMessage({type:'frame', bitmap: bitmap}, [bitmap]);
+    } catch(err){
+      console.error('Error sending frame to worker', err);
+    }
+  }
+
+  /* scheduling: use requestVideoFrameCallback si existe */
+  function scheduleFrame(){
+    if (!streaming) return;
+    frameCounter = (frameCounter + 1) % FRAME_SKIP;
+    if (cam.requestVideoFrameCallback){
+      cam.requestVideoFrameCallback(()=>{ if (frameCounter===0) sendFrameToWorker(); scheduleFrame(); });
+    } else {
+      // use rAF fallback
+      requestAnimationFrame(()=>{ if (frameCounter===0) sendFrameToWorker(); scheduleFrame(); });
+    }
+  }
+
+  // init: check page visibility and cleanup
+  window.addEventListener('pagehide', ()=>{
+    try { if (worker) worker.terminate(); } catch(e){}
+    try { const s = cam.srcObject; if (s) s.getTracks().forEach(t=>t.stop()); } catch(e){}
+  });
+
+  </script>
 </body>
 </html>
