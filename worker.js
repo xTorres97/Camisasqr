@@ -1,4 +1,4 @@
-// worker.js (mejor detección a distancia: ORB más fuerte + plantillla mayor)
+// worker.js (ajustes: INLIER_RATIO reducido para aceptar matches grandes con menos % de inliers)
 self.importScripts('https://docs.opencv.org/4.x/opencv.js');
 
 let cvReady = false;
@@ -9,12 +9,12 @@ let procW=160, procH=120;
 let MODE='detection';
 let lastTrackTime = 0;
 
-// parámetros ajustados para distancia
+// parámetros ajustados
 let MATCH_RATIO = 0.85;
 let MAX_GOOD_MATCHES = 400;
 let minMatchCount = 12;
 let MIN_INLIERS_ABS = 8;
-let INLIER_RATIO = 0.40;
+let INLIER_RATIO = 0.20; // <<--- BAJADO para aceptar 46/146
 
 self.Module = self.Module || {};
 self.Module.onRuntimeInitialized = () => { cvReady = true; postMessage({type:'ready'}); };
@@ -141,6 +141,7 @@ async function processFrameBitmap(bitmap){
   if (!cvReady || !templGray || !orb){ try{ bitmap.close(); }catch(e){} postMessage({type:'result', matches:0, inliers:0, corners:null}); return; }
   const grayMat = bitmapToGrayMat(bitmap, procW, procH);
 
+  // tracking
   if (MODE === 'tracking' && prevGray && prevPts && templPts){
     try {
       const nextPts = new cv.Mat(), status = new cv.Mat(), err = new cv.Mat();
@@ -189,6 +190,7 @@ async function processFrameBitmap(bitmap){
     }
   }
 
+  // detection
   try {
     const det = detectAndCompute(grayMat);
     const frameKps = det.kps, frameDesc = det.desc;
@@ -200,7 +202,10 @@ async function processFrameBitmap(bitmap){
     if (goodMatches.length < minMatchCount){ safeDelete(frameKps); safeDelete(frameDesc); safeDelete(grayMat); postMessage({type:'result', matches:goodMatches.length, inliers:0, corners:null}); return; }
 
     const {H, mask, inliers} = computeHomographyFromMatches(goodMatches, frameKps, templKeypoints);
-    if (H && !H.empty() && inliers >= Math.max(MIN_INLIERS_ABS, Math.floor(goodMatches.length * INLIER_RATIO))){
+
+    // Accept if absolute inliers or inlier ratio threshold (reduced ratio)
+    const requiredInliers = Math.max(MIN_INLIERS_ABS, Math.floor(goodMatches.length * INLIER_RATIO));
+    if (H && !H.empty() && inliers >= requiredInliers){
       const corners = homographyToCorners(H);
       const framePtsArr = [], templPtsArr = [];
       for (let idx=0; idx<goodMatches.length; idx++){
@@ -222,6 +227,7 @@ async function processFrameBitmap(bitmap){
     } else {
       postMessage({type:'result', matches:goodMatches.length, inliers:inliers||0, corners:null});
     }
+
     safeDelete(frameKps); safeDelete(frameDesc);
     if (!(MODE === 'tracking' && prevGray)) safeDelete(grayMat);
     return;
