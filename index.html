@@ -2,14 +2,20 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Worker + OpenCV.js</title>
+  <title>AR Camiseta - Worker (Centered, stricter match)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
     video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
-    #overlayContainer{position:fixed; left:0; top:0; pointer-events:none; z-index:9999; display:none; transform-origin:center center; background:transparent; will-change: transform, opacity; -webkit-transform: translate3d(0,0,0);}
+    #overlayContainer{
+      position:fixed; left:50%; top:50%;
+      pointer-events:none; z-index:9999;
+      display:none; transform-origin:center center;
+      background:transparent; transform:translate(-50%,-50%);
+    }
+    #overlayContainer > video { display:block; width:100%; height:100%; background:transparent; object-fit:cover; }
     #controls{position:fixed; right:12px; top:60px; z-index:10000; display:flex; flex-direction:column; gap:8px}
     .ctrlBtn{padding:10px 12px;border-radius:8px;border:none;background:#ff4fa8;color:#fff;font-weight:600}
     #startBtn{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:14px 18px;background:#ff4fa8;border-radius:10px;border:none;color:#fff;font-size:18px;z-index:40}
@@ -38,231 +44,169 @@
   <div id="log">iniciando...</div>
   <div id="bigMatch">Match: --</div>
 
-  <script>
-  // ---------- CONFIG ----------
-  const TARGET_URL = './ilustracion.png';
-  const ANIM_URL = './Animacion.webm';
+<script>
+/* ---------- CONFIG ---------- */
+const TARGET_URL = './ilustracion.png';
+const ANIM_URL = './Animacion.webm';
+let RES_SCALE = 0.40;     // escala de procesamiento (ajusta)
+let FRAME_SKIP = 3;
+let MODE = 'precision';   // 'precision'|'speed'
+const REQUIRED_MATCHES = 10;    // número mínimo de good matches para considerar detección válida
+const REQUIRED_INLIERS = 8;     // inliers mínimos
+/* ---------------------------- */
 
-  // modos y performance
-  let RES_SCALE = 0.40;     // escala de procesamiento (ajusta con toggle)
-  let FRAME_SKIP = 3;
-  let MODE = 'precision';   // 'precision'|'speed'
+const cam = document.getElementById('cam');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const overlayContainer = document.getElementById('overlayContainer');
+const startBtn = document.getElementById('startBtn');
+const logEl = document.getElementById('log');
+const bigMatch = document.getElementById('bigMatch');
+const testShow = document.getElementById('testShow');
+const testHide = document.getElementById('testHide');
+const toggleMode = document.getElementById('toggleMode');
+const forcePlay = document.getElementById('forcePlay');
 
-  // DOM
-  const cam = document.getElementById('cam');
-  const overlay = document.getElementById('overlay');
-  const ctx = overlay.getContext('2d');
-  const overlayContainer = document.getElementById('overlayContainer');
-  const startBtn = document.getElementById('startBtn');
-  const logEl = document.getElementById('log');
-  const bigMatch = document.getElementById('bigMatch');
-  const testShow = document.getElementById('testShow');
-  const testHide = document.getElementById('testHide');
-  const toggleMode = document.getElementById('toggleMode');
-  const forcePlay = document.getElementById('forcePlay');
+let worker = null;
+let streaming = false;
+let procW = 1, procH = 1;
+let offscreenForTransfer = null;
+let frameCounter = 0;
+let templW = 0, templH = 0; // recibidos desde worker
 
-  // Worker
-  let worker = null;
-  let streaming = false;
-  let frameCounter = 0;
-  let procW = 1, procH = 1;
-  let offscreenForTransfer = null; // OffscreenCanvas for producing ImageBitmap
-  let videoTrackSettings = null;
+function log(s){ logEl.textContent = s; console.log(s); }
 
-  function log(s){ logEl.textContent = s; console.log(s); }
+const overlayVideoMarkup = (filename) => `
+  <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="background:transparent;display:block;">
+    <source src="${filename}" type="video/webm">
+    <source src="${filename.replace('.webm','.mp4')}" type="video/mp4">
+  </video>`;
 
-  /* overlay video markup (same as before) */
-  const overlayVideoMarkup = (filename) => `
-    <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="background:transparent;display:block;">
-      <source src="${filename}" type="video/webm">
-      <source src="${filename.replace('.webm','.mp4')}" type="video/mp4">
-    </video>`;
+function showOverlayCenteredFixed(sizePx){
+  // center the overlayContainer (CSS already centers). Set width/height preserving aspect ratio from templW/templH
+  let w = sizePx;
+  let h = Math.round(sizePx * (templH / templW));
+  // if templ dims unknown fallback to square
+  if (!templW || !templH) { h = w; }
+  const fx = document.getElementById('fxVideo');
+  if (!fx) overlayContainer.innerHTML = overlayVideoMarkup(ANIM_URL);
+  const v = document.getElementById('fxVideo');
+  overlayContainer.style.width = Math.max(10, w) + 'px';
+  overlayContainer.style.height = Math.max(10, h) + 'px';
+  overlayContainer.style.display = 'block';
+  overlayContainer.style.visibility = 'visible';
+  try { v.play().then(()=>{ log('video play ok'); forcePlay.style.display='none'; }).catch(e=>{ log('autoplay err')}); } catch(e){}
+}
+function hideOverlay(){ const fx = document.getElementById('fxVideo'); if (fx) try{ fx.pause(); }catch(e){} overlayContainer.style.display='none'; overlayContainer.style.visibility='hidden'; }
 
-  function showOverlayCentered(cx, cy, w, h, angleDeg = 0, small=false){
-    const rect = overlay.getBoundingClientRect();
-    const screenX = rect.left + cx + window.scrollX;
-    const screenY = rect.top + cy + window.scrollY;
+forcePlay.addEventListener('click', ()=>{ const fx = document.getElementById('fxVideo'); if (fx) fx.play().catch(()=>{}); forcePlay.style.display='none'; });
+testShow.addEventListener('click', ()=> showOverlayCenteredFixed(Math.round(window.innerWidth*0.5)));
+testHide.addEventListener('click', ()=> hideOverlay());
 
-    if (!document.getElementById('fxVideo')){
-      overlayContainer.innerHTML = overlayVideoMarkup(small ? ANIM_URL.replace('.webm','_small.webm') : ANIM_URL);
-    }
-    const fx = document.getElementById('fxVideo');
-    overlayContainer.style.left = screenX + 'px';
-    overlayContainer.style.top  = screenY + 'px';
-    overlayContainer.style.width = Math.max(10, w) + 'px';
-    overlayContainer.style.height = Math.max(10, h) + 'px';
-    overlayContainer.style.display = 'block';
-    overlayContainer.style.visibility = 'visible';
-    overlayContainer.style.transform = `translate(-50%,-50%) rotate(${angleDeg}deg) translate3d(0,0,0)`;
-    fx.style.width = '100%'; fx.style.height = '100%'; fx.style.objectFit = 'cover';
-    fx.play().then(()=>{ log('video play ok'); forcePlay.style.display='none'; }).catch(err=>{ log('Autoplay error: '+err); forcePlay.style.display='block'; });
+toggleMode.addEventListener('click', ()=>{
+  if (MODE === 'precision'){
+    MODE = 'speed'; RES_SCALE = 0.22; FRAME_SKIP = 5; toggleMode.textContent = 'Modo: Velocidad'; log('Modo velocidad');
+  } else {
+    MODE = 'precision'; RES_SCALE = 0.40; FRAME_SKIP = 3; toggleMode.textContent = 'Modo: Precisión'; log('Modo precisión');
   }
-  function hideOverlay(){ const fx = document.getElementById('fxVideo'); if (fx) try{ fx.pause(); }catch(e){} overlayContainer.style.display='none'; overlayContainer.style.visibility='hidden'; }
+  // on next frame procW/procH will be recomputed
+});
 
-  forcePlay.addEventListener('click', ()=>{ const fx = document.getElementById('fxVideo'); if (fx) fx.play().catch(()=>{}); forcePlay.style.display='none'; });
+/* camera start */
+startBtn.addEventListener('click', async ()=>{ startBtn.style.display='none'; log('Activando cámara...'); await startCamera(); });
 
-  testShow.addEventListener('click', ()=>{ const r = overlay.getBoundingClientRect(); showOverlayCentered(r.width/2, r.height/2, r.width*0.5, r.height*0.5, 0); });
-  testHide.addEventListener('click', ()=>{ hideOverlay(); });
+async function startCamera(){
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+    cam.srcObject = stream;
+    await cam.play();
+    streaming = true;
+    resizeCanvas();
+    initWorker();
+    scheduleFrame();
+  } catch(e){ alert('Error al abrir la cámara: ' + e.message); console.error(e); }
+}
 
-  toggleMode.addEventListener('click', ()=>{
-    if (MODE === 'precision'){
-      MODE = 'speed'; RES_SCALE = 0.22; FRAME_SKIP = 5; toggleMode.textContent = 'Modo: Velocidad'; log('Modo velocidad');
+function resizeCanvas(){
+  overlay.width = cam.videoWidth; overlay.height = cam.videoHeight;
+  overlay.style.width = cam.clientWidth + 'px'; overlay.style.height = cam.clientHeight + 'px';
+  procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
+  procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
+  try {
+    offscreenForTransfer = new OffscreenCanvas(procW, procH);
+  } catch(e) {
+    const c = document.createElement('canvas'); c.width = procW; c.height = procH; offscreenForTransfer = c;
+  }
+}
+
+/* worker init */
+function initWorker(){
+  if (worker) { worker.terminate(); worker = null; }
+  worker = new Worker('worker.js');
+  worker.onmessage = (ev)=>{
+    const d = ev.data;
+    if (d.type === 'ready'){ log('Worker ready — cargando template...'); worker.postMessage({type:'init', targetUrl: TARGET_URL, procW, procH}); }
+    else if (d.type === 'log'){ console.log('worker:', d.msg); }
+    else if (d.type === 'error'){ console.error('worker error:', d.msg); }
+    else if (d.type === 'templateInfo'){ templW = d.w; templH = d.h; console.log('templ size from worker', templW, templH); }
+    else if (d.type === 'result'){ handleWorkerResult(d); }
+  };
+}
+
+/* handle results: now center video, no rotation; only show when good enough */
+function handleWorkerResult(d){
+  bigMatch.textContent = `Matches: ${d.matches} | Inliers: ${d.inliers}`;
+  // stricter gating
+  if (d.matches >= REQUIRED_MATCHES && d.inliers >= REQUIRED_INLIERS){
+    // pick a visible size based on screen width (half screen), but clamp if template aspect extreme
+    const sizePx = Math.round(Math.min(window.innerWidth * 0.6, window.innerHeight * 0.6));
+    showOverlayCenteredFixed(sizePx);
+  } else {
+    hideOverlay();
+  }
+}
+
+/* send downscaled frame to worker */
+async function sendFrameToWorker(){
+  if (!streaming || !worker) return;
+  // recompute proc size if RES_SCALE changed
+  const newW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
+  const newH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
+  if (newW !== procW || newH !== procH){ procW = newW; procH = newH; resizeCanvas(); worker.postMessage({type:'resize', procW, procH}); }
+
+  try {
+    let ctx2 = offscreenForTransfer.getContext('2d');
+    ctx2.drawImage(cam, 0, 0, procW, procH);
+    let bitmap;
+    if (offscreenForTransfer.transferToImageBitmap){
+      bitmap = offscreenForTransfer.transferToImageBitmap();
     } else {
-      MODE = 'precision'; RES_SCALE = 0.40; FRAME_SKIP = 3; toggleMode.textContent = 'Modo: Precisión'; log('Modo precisión');
+      const blob = await new Promise(r=> offscreenForTransfer.toBlob(r,'image/png'));
+      bitmap = await createImageBitmap(blob);
     }
-    // reinit offscreen with new size on next frame
-  });
-
-  startBtn.addEventListener('click', async ()=>{
-    startBtn.style.display='none';
-    log('Activando cámara...');
-    await startCamera();
-  });
-
-  async function startCamera(){
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
-      cam.srcObject = stream;
-      await cam.play();
-      streaming = true;
-      videoTrackSettings = stream.getVideoTracks()[0].getSettings();
-      resizeCanvas();
-      initWorker();
-      scheduleFrame(); // start loop
-    } catch(e){
-      alert('Error al abrir la cámara: ' + e.message);
-      console.error(e);
-    }
+    worker.postMessage({type:'frame', bitmap: bitmap}, [bitmap]);
+  } catch(err){
+    console.error('sendFrameToWorker err', err);
   }
+}
 
-  function resizeCanvas(){
-    overlay.width = cam.videoWidth;
-    overlay.height = cam.videoHeight;
-    overlay.style.width = cam.clientWidth + 'px';
-    overlay.style.height = cam.clientHeight + 'px';
-    // update proc sizes
-    procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
-    procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
-    // create OffscreenCanvas sized for transfer
-    try {
-      offscreenForTransfer = new OffscreenCanvas(procW, procH);
-    } catch(e){
-      // fallback: canvas element (slower). We'll create hidden canvas
-      const c = document.createElement('canvas');
-      c.width = procW; c.height = procH;
-      offscreenForTransfer = c; // will use transferToImageBitmap not available -> use bitmapFromCanvas
-    }
+/* scheduling */
+function scheduleFrame(){
+  if (!streaming) return;
+  frameCounter = (frameCounter + 1) % FRAME_SKIP;
+  if (cam.requestVideoFrameCallback){
+    cam.requestVideoFrameCallback(()=>{ if (frameCounter===0) sendFrameToWorker(); scheduleFrame(); });
+  } else {
+    requestAnimationFrame(()=>{ if (frameCounter===0) sendFrameToWorker(); scheduleFrame(); });
   }
+}
 
-  /* init worker and send init message */
-  function initWorker(){
-    if (worker) { worker.terminate(); worker = null; }
-    worker = new Worker('worker.js');
-    worker.onmessage = (ev) => {
-      const d = ev.data;
-      if (d.type === 'ready'){
-        log('Worker ready — cargando template...');
-        // send init (template URL + params)
-        worker.postMessage({type:'init', targetUrl: TARGET_URL, procW: procW, procH: procH});
-      } else if (d.type === 'log'){
-        console.log('worker:', d.msg);
-      } else if (d.type === 'result'){
-        // Resultado del worker: corners en proc-coords o null
-        handleWorkerResult(d);
-      } else if (d.type === 'error'){
-        console.error('Worker error:', d.msg);
-      }
-    };
-  }
+/* cleanup */
+window.addEventListener('pagehide', ()=>{
+  try{ if (worker) worker.terminate(); }catch(e){}
+  try{ const s = cam.srcObject; if (s) s.getTracks().forEach(t=>t.stop()); }catch(e){}
+});
 
-  /* procesa la respuesta del worker */
-  function handleWorkerResult(d){
-    // d = {type:'result', matches, inliers, corners: [x0,y0,x1,y1,...] or null, angleDeg}
-    bigMatch.textContent = `Matches: ${d.matches} | Inliers: ${d.inliers}`;
-    if (d.corners && d.corners.length === 8){
-      // corners están en coords de imagen procesada (procW x procH). Convertir a canvas overlay coords.
-      const scaleX = overlay.width / procW;
-      const scaleY = overlay.height / procH;
-      const x0 = d.corners[0]*scaleX, y0 = d.corners[1]*scaleY;
-      const x1 = d.corners[2]*scaleX, y1 = d.corners[3]*scaleY;
-      const x2 = d.corners[4]*scaleX, y2 = d.corners[5]*scaleY;
-      const x3 = d.corners[6]*scaleX, y3 = d.corners[7]*scaleY;
-
-      // bbox center/size/angle
-      const minX = Math.min(x0,x1,x2,x3), maxX = Math.max(x0,x1,x2,x3);
-      const minY = Math.min(y0,y1,y2,y3), maxY = Math.max(y0,y1,y2,y3);
-      const centerX = (minX+maxX)/2, centerY = (minY+maxY)/2;
-      const drawW = (maxX-minX), drawH = (maxY-minY);
-      // angle from edge 0->1
-      const angleRad = Math.atan2(y1-y0, x1-x0); const angleDeg = angleRad*180/Math.PI;
-
-      // draw debug polygon (optional)
-      ctx.clearRect(0,0,overlay.width,overlay.height);
-      ctx.strokeStyle='rgba(0,255,150,0.95)'; ctx.lineWidth=3;
-      ctx.beginPath();
-      ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3); ctx.closePath(); ctx.stroke();
-
-      // show overlay centered
-      showOverlayCentered(centerX, centerY, drawW, drawH, angleDeg, MODE==='speed');
-    } else {
-      // no corners => hide overlay
-      ctx.clearRect(0,0,overlay.width,overlay.height);
-      hideOverlay();
-    }
-  }
-
-  /* capture frame, downscale, transfer to worker */
-  async function sendFrameToWorker(){
-    if (!streaming || !worker) return;
-    // recompute procW/procH if RES_SCALE changed
-    const newW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
-    const newH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
-    if (newW !== procW || newH !== procH){
-      procW = newW; procH = newH; resizeCanvas(); // reinit offscreen
-      // inform worker that proc size changed
-      worker.postMessage({type:'resize', procW, procH});
-    }
-
-    // draw video into offscreen and transfer as ImageBitmap
-    try {
-      let ctx2 = offscreenForTransfer.getContext ? offscreenForTransfer.getContext('2d') : offscreenForTransfer.getContext('2d');
-      ctx2.drawImage(cam, 0, 0, procW, procH);
-
-      // transfer ImageBitmap
-      let bitmap;
-      if (offscreenForTransfer.transferToImageBitmap){
-        bitmap = offscreenForTransfer.transferToImageBitmap();
-      } else {
-        // fallback: convert canvas to blob then to ImageBitmap
-        const blob = await new Promise(res=> offscreenForTransfer.toBlob(res, 'image/png'));
-        bitmap = await createImageBitmap(blob);
-      }
-
-      // send to worker (transfer the bitmap)
-      worker.postMessage({type:'frame', bitmap: bitmap}, [bitmap]);
-    } catch(err){
-      console.error('Error sending frame to worker', err);
-    }
-  }
-
-  /* scheduling: use requestVideoFrameCallback si existe */
-  function scheduleFrame(){
-    if (!streaming) return;
-    frameCounter = (frameCounter + 1) % FRAME_SKIP;
-    if (cam.requestVideoFrameCallback){
-      cam.requestVideoFrameCallback(()=>{ if (frameCounter===0) sendFrameToWorker(); scheduleFrame(); });
-    } else {
-      // use rAF fallback
-      requestAnimationFrame(()=>{ if (frameCounter===0) sendFrameToWorker(); scheduleFrame(); });
-    }
-  }
-
-  // init: check page visibility and cleanup
-  window.addEventListener('pagehide', ()=>{
-    try { if (worker) worker.terminate(); } catch(e){}
-    try { const s = cam.srcObject; if (s) s.getTracks().forEach(t=>t.stop()); } catch(e){}
-  });
-
-  </script>
+</script>
 </body>
 </html>
