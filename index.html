@@ -2,19 +2,14 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta - Centrado + Worker (estricto)</title>
+  <title>AR Camiseta - Mejorado (distancia)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
     #videoWrapper{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;overflow:hidden}
     video#cam{width:100%;height:100%;object-fit:cover;}
     canvas#overlay{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none; z-index:20}
-    #overlayContainer{
-      position:fixed; left:50%; top:50%;
-      pointer-events:none; z-index:9999;
-      display:none; transform-origin:center center;
-      background:transparent; transform:translate(-50%,-50%);
-    }
+    #overlayContainer{position:fixed; left:50%; top:50%; pointer-events:none; z-index:9999; display:none; transform-origin:center center; background:transparent; transform:translate(-50%,-50%);}
     #overlayContainer > video { display:block; width:100%; height:100%; background:transparent; object-fit:cover; }
     #controls{position:fixed; right:12px; top:60px; z-index:10000; display:flex; flex-direction:column; gap:8px}
     .ctrlBtn{padding:10px 12px;border-radius:8px;border:none;background:#ff4fa8;color:#fff;font-weight:600}
@@ -49,15 +44,15 @@
 const TARGET_URL = './ilustracion.png';
 const ANIM_URL = './Animacion.webm';
 
-// performance modes
-let RES_SCALE = 0.40;     // escala de procesamiento (ajusta)
-let FRAME_SKIP = 3;
-let MODE = 'precision';   // 'precision'|'speed'
+// performance/thresholds
+let RES_SCALE = 0.70;     // **más alto** en Precisión para detectar a distancia
+let FRAME_SKIP = 2;
+let MODE = 'precision';
 
-// gating y centroid
-const REQUIRED_MATCHES = 10;    // matches minimos
-const REQUIRED_INLIERS = 8;     // inliers minimos
-const CENTROID_THRESHOLD = 0.18; // distancia normalizada (0..1) al centro para permitir mostrar overlay
+const REQUIRED_MATCHES = 10;
+const REQUIRED_INLIERS = 8;
+const CENTROID_THRESHOLD = 0.18;
+
 /* ---------------------------- */
 
 const cam = document.getElementById('cam');
@@ -77,7 +72,7 @@ let streaming = false;
 let procW = 1, procH = 1;
 let offscreenForTransfer = null;
 let frameCounter = 0;
-let templW = 0, templH = 0; // plantilla size que envía worker
+let templW = 0, templH = 0;
 
 function log(s){ logEl.textContent = s; console.log(s); }
 
@@ -88,7 +83,6 @@ const overlayVideoMarkup = (filename) => `
   </video>`;
 
 function showOverlayCenteredFixed(sizePx){
-  // calcula tamaño respetando aspecto de template
   let w = sizePx;
   let h = Math.round(sizePx * (templH && templW ? (templH / templW) : 1));
   if (!templW || !templH) { h = w; }
@@ -108,11 +102,10 @@ testHide.addEventListener('click', ()=> hideOverlay());
 
 toggleMode.addEventListener('click', ()=>{
   if (MODE === 'precision'){
-    MODE = 'speed'; RES_SCALE = 0.22; FRAME_SKIP = 5; toggleMode.textContent = 'Modo: Velocidad'; log('Modo velocidad');
+    MODE = 'speed'; RES_SCALE = 0.28; FRAME_SKIP = 4; toggleMode.textContent = 'Modo: Velocidad'; log('Modo velocidad');
   } else {
-    MODE = 'precision'; RES_SCALE = 0.40; FRAME_SKIP = 3; toggleMode.textContent = 'Modo: Precisión'; log('Modo precisión');
+    MODE = 'precision'; RES_SCALE = 0.70; FRAME_SKIP = 2; toggleMode.textContent = 'Modo: Precisión'; log('Modo precisión');
   }
-  // reinit sizes next frame
 });
 
 startBtn.addEventListener('click', async ()=>{ startBtn.style.display='none'; log('Activando cámara...'); await startCamera(); });
@@ -134,11 +127,7 @@ function resizeCanvas(){
   overlay.style.width = cam.clientWidth + 'px'; overlay.style.height = cam.clientHeight + 'px';
   procW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
   procH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
-  try {
-    offscreenForTransfer = new OffscreenCanvas(procW, procH);
-  } catch(e) {
-    const c = document.createElement('canvas'); c.width = procW; c.height = procH; offscreenForTransfer = c;
-  }
+  try { offscreenForTransfer = new OffscreenCanvas(procW, procH); } catch(e) { const c = document.createElement('canvas'); c.width = procW; c.height = procH; offscreenForTransfer = c; }
 }
 
 /* worker init */
@@ -155,9 +144,8 @@ function initWorker(){
   };
 }
 
-/* reemplazamos por la versión con centroid gating */
+/* centroid + gating */
 function handleWorkerResult(d){
-  // d: {matches, inliers, corners: [x0,y0,...] | null}
   bigMatch.textContent = `Matches: ${d.matches} | Inliers: ${d.inliers}`;
 
   if (!d.corners || d.matches < REQUIRED_MATCHES || d.inliers < REQUIRED_INLIERS){
@@ -165,7 +153,6 @@ function handleWorkerResult(d){
     return;
   }
 
-  // calcular centroid en proc coords y mapear a pantalla coords
   const scaleX = overlay.width / procW;
   const scaleY = overlay.height / procH;
   const cx_proc = (d.corners[0] + d.corners[2] + d.corners[4] + d.corners[6]) / 4.0;
@@ -182,20 +169,17 @@ function handleWorkerResult(d){
   const distNorm = Math.hypot(dx, dy) / diag;
 
   if (distNorm > CENTROID_THRESHOLD){
-    // marker detectado pero no centrado: no mostramos
     hideOverlay();
     return;
   }
 
-  // ok: mostrar overlay centrado (sin rotación) con tamaño razonable
   const sizePx = Math.round(Math.min(window.innerWidth * 0.6, window.innerHeight * 0.6));
   showOverlayCenteredFixed(sizePx);
 }
 
-/* send frame downscaled to worker */
+/* send frame */
 async function sendFrameToWorker(){
   if (!streaming || !worker) return;
-  // recompute proc size if RES_SCALE changed
   const newW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
   const newH = Math.max(1, Math.floor(cam.videoHeight * RES_SCALE));
   if (newW !== procW || newH !== procH){ procW = newW; procH = newH; resizeCanvas(); worker.postMessage({type:'resize', procW, procH}); }
@@ -216,7 +200,7 @@ async function sendFrameToWorker(){
   }
 }
 
-/* scheduling loop */
+/* scheduling */
 function scheduleFrame(){
   if (!streaming) return;
   frameCounter = (frameCounter + 1) % FRAME_SKIP;
