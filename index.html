@@ -2,7 +2,7 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <title>AR Camiseta — con botón foto/record</title>
+  <title>AR Camiseta — con foto/record (.mp4 preferido)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0" />
   <style>
     html,body{margin:0;height:100%;background:#000;color:#fff;font-family:Arial, sans-serif}
@@ -44,9 +44,6 @@
     .progressRing svg { width:100%; height:100%; }
     .progressRing circle { fill:none; stroke:rgba(255,255,255,0.18); stroke-width:6; stroke-linecap:round; }
     .progressRing .progress { stroke: #fff; stroke-width:6; stroke-linecap:round; stroke-dasharray: 283; stroke-dashoffset: 283; transition: stroke-dashoffset 0.08s linear; }
-
-    /* indicador texto */
-    #cameraHelp { position:fixed; left:50%; bottom:120px; transform:translateX(-50%); z-index:11001; color:#fff; font-size:14px; opacity:0.9; pointer-events:none;}
   </style>
 </head>
 <body>
@@ -63,7 +60,7 @@
     <button id="toggleMode" class="ctrlBtn">Modo: Precisión</button>
   </div>
 
-  <!-- Botón circular foto/record -->
+  <!-- Botón circular foto/record (sin texto de ayuda) -->
   <div class="cameraBar">
     <div id="shutter" class="shutterBtn" role="button" aria-label="Botón cámara">
       <div class="progressRing" aria-hidden="true">
@@ -76,7 +73,6 @@
       <div class="shutterInner"></div>
     </div>
   </div>
-  <div id="cameraHelp">Click: foto · Mantén: grabar</div>
 
   <button id="startBtn">Activar AR</button>
 
@@ -84,7 +80,7 @@
   <div id="bigMatch">Match: --</div>
 
 <script>
-/* ---------- CONFIG (igual que antes) ---------- */
+/* ---------- CONFIG ---------- */
 const TARGET_URL = './ilustracion.png';
 const ANIM_URL = './Animacion.webm';
 let RES_SCALE = 0.70;
@@ -93,7 +89,7 @@ let MODE = 'precision';
 const REQUIRED_MATCHES = 10;
 const REQUIRED_INLIERS = 8;
 const CENTROID_THRESHOLD = 0.20;
-/* ---------------------------------------------- */
+/* ---------------------------- */
 
 const cam = document.getElementById('cam');
 const overlay = document.getElementById('overlay');
@@ -115,14 +111,12 @@ let videoStream = null; // referencia al MediaStream usada para recorder
 
 function log(s){ logEl.textContent = s; console.log(s); }
 
-/* overlay video markup igual que antes */
 const overlayVideoMarkup = (filename) => `
   <video id="fxVideo" autoplay loop muted playsinline preload="auto" crossorigin="anonymous" style="background:transparent;display:block;">
     <source src="${filename}" type="video/webm">
     <source src="${filename.replace('.webm','.mp4')}" type="video/mp4">
   </video>`;
 
-/* Mostrar/ocultar overlay (centrado sin rotación) */
 function showOverlayCenteredFixed(sizePx){
   let w = sizePx;
   let h = Math.round(sizePx * (templH && templW ? (templH / templW) : 1));
@@ -137,7 +131,6 @@ function showOverlayCenteredFixed(sizePx){
 }
 function hideOverlay(){ const fx = document.getElementById('fxVideo'); if (fx) try{ fx.pause(); }catch(e){} overlayContainer.style.display='none'; overlayContainer.style.visibility='hidden'; }
 
-/* botones de control (igual que antes) */
 testShow.addEventListener('click', ()=> showOverlayCenteredFixed(Math.round(window.innerWidth*0.5)));
 testHide.addEventListener('click', ()=> hideOverlay());
 toggleMode.addEventListener('click', ()=>{
@@ -145,7 +138,6 @@ toggleMode.addEventListener('click', ()=>{
   else { MODE = 'precision'; RES_SCALE = 0.70; FRAME_SKIP = 2; toggleMode.textContent = 'Modo: Precisión'; log('Modo precisión'); }
 });
 
-/* cámara */
 startBtn.addEventListener('click', async ()=>{ startBtn.style.display='none'; log('Activando cámara...'); await startCamera(); });
 
 async function startCamera(){
@@ -168,7 +160,7 @@ function resizeCanvas(){
   try { offscreenForTransfer = new OffscreenCanvas(procW, procH); } catch(e) { const c = document.createElement('canvas'); c.width = procW; c.height = procH; offscreenForTransfer = c; }
 }
 
-/* worker init (igual) */
+/* worker init */
 function initWorker(){
   if (worker) { worker.terminate(); worker = null; }
   worker = new Worker('worker.js');
@@ -182,7 +174,7 @@ function initWorker(){
   };
 }
 
-/* mapping mejorado usando bounding rect del video (como antes) */
+/* mapping using video DOM rect (handles object-fit cropping) */
 function handleWorkerResult(d){
   bigMatch.textContent = `Matches: ${d.matches} | Inliers: ${d.inliers}`;
 
@@ -217,7 +209,7 @@ function handleWorkerResult(d){
   showOverlayCenteredFixed(sizePx);
 }
 
-/* enviar frame al worker */
+/* send frame to worker */
 async function sendFrameToWorker(){
   if (!streaming || !worker) return;
   const newW = Math.max(1, Math.floor(cam.videoWidth * RES_SCALE));
@@ -270,11 +262,10 @@ let holdTimer = null;
 let isRecording = false;
 let mediaRecorder = null;
 let recordedChunks = [];
-const HOLD_TO_RECORD_MS = 400; // tiempo necesario para iniciar grabación
-const MAX_RECORD_MS = 60 * 1000; // límite opcional (1 min)
+const HOLD_TO_RECORD_MS = 400; // tiempo para iniciar grabación
+const MAX_RECORD_MS = 60 * 1000; // 1 min
 let recordTimeout = null;
 
-// helper: descargar blob
 function downloadBlob(blob, filename){
   const a = document.createElement('a');
   const url = URL.createObjectURL(blob);
@@ -284,13 +275,11 @@ function downloadBlob(blob, filename){
   setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 5000);
 }
 
-// tomar foto ahora (captura del video)
 function takePhoto(){
   if (!streaming) { console.warn('no stream'); return; }
   const w = cam.videoWidth, h = cam.videoHeight;
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const cx = c.getContext('2d');
-  // dibujar frame real (no el offscreen reduzido)
   cx.drawImage(cam, 0, 0, w, h);
   c.toBlob((blob)=>{
     if (!blob) return;
@@ -299,21 +288,35 @@ function takePhoto(){
   }, 'image/png');
 }
 
-// inicializar MediaRecorder si es posible
+// Preferir mp4; si no está disponible, usar webm
 function initMediaRecorder(){
   if (!videoStream) { console.warn('mediaStream no disponible'); return null; }
-  let options = {};
-  // prefer webm vp9/avc si disponible
-  if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) options.mimeType = 'video/webm;codecs=vp9';
-  else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) options.mimeType = 'video/webm;codecs=vp8';
-  else if (MediaRecorder.isTypeSupported('video/mp4')) options.mimeType = 'video/mp4';
-  try {
-    const mr = new MediaRecorder(videoStream, options);
-    return mr;
-  } catch(e){
-    console.error('MediaRecorder init error', e);
-    return null;
+  let mr = null;
+  // prefer mp4
+  const tryTypes = [
+    'video/mp4;codecs="avc1.42E01E"', // common mp4 baseline (may not be supported)
+    'video/mp4',
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm'
+  ];
+  for (const t of tryTypes){
+    try {
+      if (!MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(t)){
+        mr = new MediaRecorder(videoStream, t ? { mimeType: t } : undefined);
+        console.log('MediaRecorder init type=', t);
+        return mr;
+      }
+    } catch(e){
+      console.warn('MediaRecorder try failed for', t, e);
+      mr = null;
+    }
   }
+  // último intento sin opciones
+  try {
+    mr = new MediaRecorder(videoStream);
+    return mr;
+  } catch(e){ console.error('MediaRecorder not supported', e); return null; }
 }
 
 function startRecording(){
@@ -326,19 +329,22 @@ function startRecording(){
   mediaRecorder.onstop = ()=> {
     const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'video/webm' });
     const ts = Date.now();
-    downloadBlob(blob, `video_ar_${ts}.webm`);
+    // elegir extensión según mimeType
+    let ext = 'webm';
+    if (mediaRecorder.mimeType && mediaRecorder.mimeType.includes('mp4')) ext = 'mp4';
+    else if (mediaRecorder.mimeType && mediaRecorder.mimeType.includes('webm')) ext = 'webm';
+    downloadBlob(blob, `video_ar_${ts}.${ext}`);
     recordedChunks = [];
     isRecording = false;
     shutter.classList.remove('recording');
     recDot.style.display = 'none';
     log('Grabación finalizada');
   };
-  mediaRecorder.start(200); // recolectar cada 200ms
+  mediaRecorder.start(200);
   isRecording = true;
   shutter.classList.add('recording');
   recDot.style.display = 'block';
   log('Grabando...');
-  // opcional: límite máximo para la grabación
   recordTimeout = setTimeout(()=>{ if (isRecording) stopRecording(); }, MAX_RECORD_MS);
 }
 
@@ -348,23 +354,15 @@ function stopRecording(){
   if (recordTimeout){ clearTimeout(recordTimeout); recordTimeout = null; }
 }
 
-// animar anillo según progreso (0..1)
-function setProgress(p){
-  // círculo r=45 -> perímetro ~ 2πr ≈ 283
-  const dash = 283 * (1 - Math.max(0, Math.min(1, p)));
-  progressCircle.style.strokeDashoffset = String(dash);
-}
+function setProgress(p){ const dash = 283 * (1 - Math.max(0, Math.min(1, p))); progressCircle.style.strokeDashoffset = String(dash); }
 
-/* lógica de hold/click combinada (mouse + touch) */
-let holdStartTime = 0;
 let progressRAF = null;
+let holdStartTime = 0;
 
 function onPressStart(evt){
   evt.preventDefault();
-  // start timer to enter recording mode
   holdStartTime = performance.now();
   setProgress(1);
-  // animate progress down to 0 in HOLD_TO_RECORD_MS
   const start = holdStartTime;
   function tick(){
     const now = performance.now();
@@ -372,7 +370,6 @@ function onPressStart(evt){
     const p = Math.max(0, 1 - (elapsed / HOLD_TO_RECORD_MS));
     setProgress(p);
     if (elapsed >= HOLD_TO_RECORD_MS){
-      // start recording
       setProgress(0);
       startRecording();
       cancelHoldAnim();
@@ -386,10 +383,9 @@ function onPressStart(evt){
 function cancelHoldAnim(){
   if (progressRAF) cancelAnimationFrame(progressRAF);
   progressRAF = null;
-  setProgress(1); // reset circular progress
+  setProgress(1);
 }
 
-// release: if recording -> stop; if not recording and held less than threshold -> take photo
 function onPressEnd(evt){
   evt.preventDefault();
   const dt = performance.now() - holdStartTime;
@@ -397,36 +393,27 @@ function onPressEnd(evt){
   if (isRecording){
     stopRecording();
   } else {
-    if (dt < HOLD_TO_RECORD_MS + 60){ // pequeño tolerance
-      // short press -> foto
+    if (dt < HOLD_TO_RECORD_MS + 60){
       shutterInner.style.transform = 'scale(0.95)';
       setTimeout(()=> shutterInner.style.transform = '', 90);
       takePhoto();
       log('Foto tomada');
     } else {
-      // was held long enough but media recorder maybe not started yet; ensure stop if started
       stopRecording();
     }
   }
   holdStartTime = 0;
 }
 
-/* attach mouse + touch events */
+/* attach events */
 (function attachShutterEvents(){
-  // mouse
   shutter.addEventListener('mousedown', (e)=> onPressStart(e));
-  document.addEventListener('mouseup', (e)=> {
-    // only trigger end if pressing started inside shutter (to avoid global mouseup)
-    onPressEnd(e);
-  });
-
-  // touch
+  document.addEventListener('mouseup', (e)=> onPressEnd(e));
   shutter.addEventListener('touchstart', (e)=> onPressStart(e), {passive:false});
   shutter.addEventListener('touchend', (e)=> onPressEnd(e), {passive:false});
   shutter.addEventListener('touchcancel', (e)=> onPressEnd(e), {passive:false});
 })();
 
-/* ensure videoStream variable set when camera started: already assigned in startCamera */
 </script>
 </body>
 </html>
