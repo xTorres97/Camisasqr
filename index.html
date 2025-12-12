@@ -17,7 +17,7 @@
     #log{position:fixed;left:8px;top:8px;background:rgba(0,0,0,0.6);padding:6px 8px;border-radius:6px;font-size:12px;z-index:40}
     #bigMatch{position:fixed;left:8px;top:48px;font-size:18px;font-weight:700;color:#fff;text-shadow:0 0 6px #000;z-index:40}
 
-    /* Botón circular de foto/record */
+    /* Botón circular foto/record */
     .cameraBar { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 11000; display:flex; align-items:center; justify-content:center; }
     .shutterBtn {
       width: 88px; height: 88px; border-radius: 50%;
@@ -174,7 +174,50 @@ function initWorker(){
   };
 }
 
-/* mapping using video DOM rect (handles object-fit cropping) */
+/* mapping using video DOM rect (handles object-fit:cover) */
+/* devuelve {dx,dy,dw,dh} en coordenadas de píxeles del frame de vídeo (no pantalla),
+   y mantiene la relación de aspecto del fxVideo (fit contain dentro de la caja objetivo) */
+function mapOverlayScreenToVideoPixels(oRect, vRect, fx){
+  // scale usado por object-fit: cover
+  const scale = Math.max(vRect.width / cam.videoWidth, vRect.height / cam.videoHeight);
+  const displayedW = cam.videoWidth * scale;
+  const displayedH = cam.videoHeight * scale;
+  const offsetX = (displayedW - vRect.width) / 2;
+  const offsetY = (displayedH - vRect.height) / 2;
+
+  const videoLeft = vRect.left + window.scrollX;
+  const videoTop = vRect.top + window.scrollY;
+  const overlayLeft = oRect.left + window.scrollX;
+  const overlayTop = oRect.top + window.scrollY;
+
+  // convertir a coordenadas en el "canvas de video" (píxeles del video source)
+  const dstX = (overlayLeft - videoLeft + offsetX) / scale;
+  const dstY = (overlayTop - videoTop + offsetY) / scale;
+  const dstW = oRect.width / scale;
+  const dstH = oRect.height / scale;
+
+  // preservar aspect ratio del fx (fit contain dentro de dstW x dstH)
+  const fxW = (fx && (fx.videoWidth || fx.clientWidth)) || 1;
+  const fxH = (fx && (fx.videoHeight || fx.clientHeight)) || 1;
+  const fxAspect = fxW / fxH;
+  const boxAspect = dstW / dstH;
+
+  let drawW = dstW, drawH = dstH, offX = 0, offY = 0;
+  if (fxAspect > boxAspect){
+    // fx es proporcionalmente más ancho -> ajustamos por ancho
+    drawW = dstW;
+    drawH = dstW / fxAspect;
+    offY = (dstH - drawH) / 2;
+  } else {
+    // fx es proporcionalmente más alto -> ajustamos por alto
+    drawH = dstH;
+    drawW = dstH * fxAspect;
+    offX = (dstW - drawW) / 2;
+  }
+
+  return { dx: dstX + offX, dy: dstY + offY, dw: drawW, dh: drawH };
+}
+
 function handleWorkerResult(d){
   bigMatch.textContent = `Matches: ${d.matches} | Inliers: ${d.inliers}`;
 
@@ -184,16 +227,17 @@ function handleWorkerResult(d){
   }
 
   const vRect = cam.getBoundingClientRect();
+
+  const cx_proc = (d.corners[0] + d.corners[2] + d.corners[4] + d.corners[6]) / 4.0;
+  const cy_proc = (d.corners[1] + d.corners[3] + d.corners[5] + d.corners[7]) / 4.0;
+
   const scaleX_video = vRect.width / cam.videoWidth;
   const scaleY_video = vRect.height / cam.videoHeight;
   const videoLeft = vRect.left + window.scrollX;
   const videoTop = vRect.top + window.scrollY;
 
-  const cx_proc = (d.corners[0] + d.corners[2] + d.corners[4] + d.corners[6]) / 4.0;
-  const cy_proc = (d.corners[1] + d.corners[3] + d.corners[5] + d.corners[7]) / 4.0;
-
-  const cx_screen = videoLeft + cx_proc * scaleX_video;
-  const cy_screen = videoTop + cy_proc * scaleY_video;
+  const cx_screen = videoLeft + cx_proc * (Math.max(vRect.width / cam.videoWidth, vRect.height / cam.videoHeight) * (cam.videoWidth / cam.videoWidth));
+  const cy_screen = videoTop + cy_proc * (Math.max(vRect.width / cam.videoWidth, vRect.height / cam.videoHeight) * (cam.videoHeight / cam.videoHeight));
 
   const screenCenterX = window.scrollX + (window.innerWidth / 2);
   const screenCenterY = window.scrollY + (window.innerHeight / 2);
@@ -282,7 +326,7 @@ function downloadBlob(blob, filename){
   setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 5000);
 }
 
-/* FOTO: Reemplazo takePhoto para incluir el overlay (fxVideo) */
+/* FOTO: Reemplazo takePhoto para incluir el overlay (fxVideo) y mantener aspect ratio */
 async function takePhoto(){
   if (!streaming) { console.warn('no stream'); return; }
   const w = cam.videoWidth, h = cam.videoHeight;
@@ -292,32 +336,17 @@ async function takePhoto(){
   // 1) dibujar frame de cámara (frame completo en resolución de video)
   try { cx.drawImage(cam, 0, 0, w, h); } catch(e){ console.warn('drawImage(cam) failed', e); }
 
-  // 2) si existe fxVideo y está visible, dibujar la animación en la posición correcta
+  // 2) si existe fxVideo y está visible, dibujar la animación en la posición correcta (sin estirar)
   const fx = document.getElementById('fxVideo');
   if (fx && overlayContainer.style.display !== 'none'){
-    // Mapeo igual que en handleWorkerResult: calcular escala entre elemento video y resolución video
     const vRect = cam.getBoundingClientRect();
-    const scaleX_video = vRect.width / cam.videoWidth;
-    const scaleY_video = vRect.height / cam.videoHeight;
-    const videoLeft = vRect.left + window.scrollX;
-    const videoTop = vRect.top + window.scrollY;
-
     const oRect = overlayContainer.getBoundingClientRect();
-    const overlayLeft = oRect.left + window.scrollX;
-    const overlayTop = oRect.top + window.scrollY;
-    const overlayW_screen = oRect.width;
-    const overlayH_screen = oRect.height;
-
-    // calcular destino en coordenadas de pixels del frame de video (no de pantalla)
-    const dstX_video = (overlayLeft - videoLeft) / scaleX_video;
-    const dstY_video = (overlayTop - videoTop) / scaleY_video;
-    const dstW_video = overlayW_screen / scaleX_video;
-    const dstH_video = overlayH_screen / scaleY_video;
-
+    const mapped = mapOverlayScreenToVideoPixels(oRect, vRect, fx);
     try {
-      // Draw current frame of fx video into canvas scaled to target area
-      cx.drawImage(fx, 0, 0, fx.videoWidth || fx.clientWidth, fx.videoHeight || fx.clientHeight,
-                        dstX_video, dstY_video, dstW_video, dstH_video);
+      cx.drawImage(fx,
+        0, 0, fx.videoWidth || fx.clientWidth, fx.videoHeight || fx.clientHeight,
+        mapped.dx, mapped.dy, mapped.dw, mapped.dh
+      );
     } catch(e){
       console.warn('error dibujando fxVideo en canvas', e);
     }
@@ -391,7 +420,8 @@ function initMediaRecorderWithStream(stream){
   } catch(e){ console.error('MediaRecorder not supported', e); return null; }
 }
 
-/* NEW: startRecording/stopRecording que usan canvas.captureStream() + audio */
+/* NEW: startRecording/stopRecording que usan canvas.captureStream() + audio,
+   y mantienen la forma del fx al dibujarlo (mapOverlayScreenToVideoPixels) */
 async function startRecording(){
   if (!videoStream) { console.warn('mediaStream no disponible'); return; }
   if (isRecording) return;
@@ -402,7 +432,7 @@ async function startRecording(){
   recordingCanvas.height = cam.videoHeight || 480;
   recordingCtx = recordingCanvas.getContext('2d');
 
-  // dibujado: cámara + efecto si existe
+  // dibujado: cámara + efecto si existe (con mapeo que preserva aspecto)
   const fx = document.getElementById('fxVideo');
 
   function drawFrame(){
@@ -411,28 +441,16 @@ async function startRecording(){
       recordingCtx.drawImage(cam, 0, 0, recordingCanvas.width, recordingCanvas.height);
     } catch(e){ /* puede fallar si cam no lista */ }
 
-    // 2) dibujar fxVideo si visible
+    // 2) dibujar fxVideo si visible y mantener aspecto
     if (fx && overlayContainer.style.display !== 'none'){
       const vRect = cam.getBoundingClientRect();
-      const scaleX_video = vRect.width / cam.videoWidth;
-      const scaleY_video = vRect.height / cam.videoHeight;
-      const videoLeft = vRect.left + window.scrollX;
-      const videoTop = vRect.top + window.scrollY;
-
       const oRect = overlayContainer.getBoundingClientRect();
-      const overlayLeft = oRect.left + window.scrollX;
-      const overlayTop = oRect.top + window.scrollY;
-      const overlayW_screen = oRect.width;
-      const overlayH_screen = oRect.height;
-
-      const dstX_video = (overlayLeft - videoLeft) / scaleX_video;
-      const dstY_video = (overlayTop - videoTop) / scaleY_video;
-      const dstW_video = overlayW_screen / scaleX_video;
-      const dstH_video = overlayH_screen / scaleY_video;
-
+      const mapped = mapOverlayScreenToVideoPixels(oRect, vRect, fx);
       try {
-        recordingCtx.drawImage(fx, 0, 0, fx.videoWidth || fx.clientWidth, fx.videoHeight || fx.clientHeight,
-                                     dstX_video, dstY_video, dstW_video, dstH_video);
+        recordingCtx.drawImage(fx,
+          0, 0, fx.videoWidth || fx.clientWidth, fx.videoHeight || fx.clientHeight,
+          mapped.dx, mapped.dy, mapped.dw, mapped.dh
+        );
       } catch(e){
         // drawImage puede lanzar si fxVideo no tiene contenido por CORS o por estado
       }
